@@ -1,0 +1,141 @@
+#!/bin/sh
+# Renders this container's nginx site config from DOMAIN/SPACES_*/CONTROL_*
+# env vars, wires up object storage credentials, then hands off to nginx.
+set -eu
+
+: "${DOMAIN:?DOMAIN env var is required, e.g. stream1.example.com}"
+: "${SPACES_PREFIX:=recordings}"
+: "${KEEP_LOCAL_RECORDINGS:=false}"
+export DOMAIN
+
+NGINX_PREFIX=/usr/local/nginx
+TEMPLATES=$NGINX_PREFIX/conf/templates
+CONF_D=$NGINX_PREFIX/conf/conf.d
+RTMP_D=$NGINX_PREFIX/conf/rtmp.d
+
+mkdir -p "$CONF_D" "$RTMP_D" /tmp/rec /tmp/hls /tmp/dash /tmp/rec-pending
+rm -f "$CONF_D"/*.conf "$RTMP_D"/*.conf
+# nginx workers run as the compiled-in default user, not root - make sure
+# they can write recordings/segments regardless of what that user turns
+# out to be
+chmod 1777 /tmp/rec /tmp/hls /tmp/dash
+# /tmp/rec-pending holds pending record-start.cgi filenames: written by
+# root (via fcgiwrap) but read AND DELETED by record-done.sh, which runs
+# as the nginx worker's user - no sticky bit here, since sticky would let
+# only a file's owner delete it, and these two users need to delete each
+# other's files
+chmod 777 /tmp/rec-pending
+
+# --- object storage (DigitalOcean Spaces or any S3-compatible endpoint) --
+UPLOAD_ENABLED=false
+if [ -n "${SPACES_KEY:-}" ] && [ -n "${SPACES_SECRET:-}" ] \
+   && [ -n "${SPACES_BUCKET:-}" ] && [ -n "${SPACES_ENDPOINT:-}" ]; then
+    # a bad key/endpoint here shouldn't take the whole stream down - fall
+    # back to local-only recording and let the operator fix it later
+    if mc alias set spaces "https://${SPACES_ENDPOINT}" "$SPACES_KEY" "$SPACES_SECRET" >/dev/null 2>&1; then
+        UPLOAD_ENABLED=true
+        echo "[setup] recordings will be uploaded to spaces/${SPACES_BUCKET}/${SPACES_PREFIX}/${DOMAIN}/"
+    else
+        echo "[setup] failed to reach SPACES_ENDPOINT (${SPACES_ENDPOINT}) - recordings stay local only, in /tmp/rec" >&2
+    fi
+else
+    echo "[setup] SPACES_ENDPOINT/SPACES_BUCKET/SPACES_KEY/SPACES_SECRET not all set - recordings stay local only, in /tmp/rec"
+fi
+# non-empty placeholders: an empty token here would shift the positional
+# args nginx passes to record-done.sh via exec_record_done
+: "${SPACES_BUCKET:=-}"
+: "${SPACES_PREFIX:=-}"
+
+# --- ingest keys vs playback ids ----------------------------------------
+# stream_keys.map (on the /data volume, so it survives restarts) holds
+# every valid "<stream_key>" playback_id; pair. playback_id is a one-way
+# sha256 encoding of stream_key - derivable from the key, but the key
+# can't be recovered from it - so a known playback URL can't be used to
+# publish. Add more keys any time with `docker exec <container>
+# mint-key.sh`, no restart needed. Here we only seed the map on first
+# boot: from STREAM_KEY if given, otherwise by generating one, and only
+# if it's not already there (so restarts don't grow the file).
+MAP_FILE=/data/stream_keys.map
+LOCK_FILE=/data/stream_keys.map.lock
+mkdir -p /data
+touch "$MAP_FILE" "$LOCK_FILE"
+
+sha256_16() { printf '%s' "$1" | openssl dgst -sha256 -hex | awk '{print $NF}' | cut -c1-16; }
+
+if [ -n "${STREAM_KEY:-}" ]; then
+    # gets written verbatim into an nginx-parsed map file below - restrict
+    # to a safe charset rather than risk config injection from .env
+    case "$STREAM_KEY" in
+        *[!A-Za-z0-9_-]*)
+            echo "[setup] STREAM_KEY must only contain letters, digits, '_' or '-'" >&2
+            exit 1
+            ;;
+    esac
+    SEEDED_KEY=$STREAM_KEY
+elif [ ! -s "$MAP_FILE" ]; then
+    SEEDED_KEY=$(openssl rand -hex 20)
+    echo "[setup] generated an initial stream key (keep it secret)"
+    echo "[setup] set STREAM_KEY env var to pin this across restarts"
+else
+    SEEDED_KEY=""
+fi
+
+if [ -n "$SEEDED_KEY" ]; then
+    SEEDED_PLAYBACK_ID=$(sha256_16 "$SEEDED_KEY")
+    (
+        flock -x 9
+        if ! grep -qF "\"${SEEDED_KEY}\"" "$MAP_FILE"; then
+            printf '"%s" %s;\n' "$SEEDED_KEY" "$SEEDED_PLAYBACK_ID" >> "$MAP_FILE"
+        fi
+    ) 9>"$LOCK_FILE"
+    echo "[setup] publish to:  rtmp://${DOMAIN}/stream/${SEEDED_PLAYBACK_ID}?key=${SEEDED_KEY}"
+    echo "[setup] play back:   http://${DOMAIN}/hls/${SEEDED_PLAYBACK_ID}.m3u8"
+    echo "${SEEDED_PLAYBACK_ID}" > "$NGINX_PREFIX/html/playback-id.txt"
+fi
+echo "[setup] mint more stream keys any time: docker exec <container> mint-key.sh"
+echo "[setup] or via the API:                 POST /admin/keys (Authorization: Bearer <token>)"
+
+# --- admin API (POST/DELETE /admin/keys, see admin-api.cgi) ------------
+# lets an external backend mint/revoke keys over HTTP instead of needing
+# docker exec. Served via fcgiwrap, which we start ourselves - nginx just
+# proxies /admin to it. Put this behind HTTPS in production: the bearer
+# token below is a plain secret on the wire otherwise.
+if [ -z "${ADMIN_API_TOKEN:-}" ]; then
+    ADMIN_API_TOKEN=$(openssl rand -hex 24)
+    echo "[setup] generated ADMIN_API_TOKEN (keep this secret): ${ADMIN_API_TOKEN}"
+    echo "[setup] set ADMIN_API_TOKEN env var to pin this across restarts"
+fi
+export ADMIN_API_TOKEN
+mkdir -p /run
+rm -f /run/fcgiwrap.sock
+fcgiwrap -s unix:/run/fcgiwrap.sock &
+# nginx workers run as the compiled-in default user (not root, see the
+# /tmp/rec note above) - wait for fcgiwrap to create the socket, then
+# open it up so that user can connect to it too
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -S /run/fcgiwrap.sock ] && break
+    sleep 0.2
+done
+chmod 666 /run/fcgiwrap.sock
+
+# --- /control API basic auth ------------------------------------------
+CONTROL_HTPASSWD=$NGINX_PREFIX/conf/control.htpasswd
+CONTROL_USER=${CONTROL_USER:-admin}
+if [ -z "${CONTROL_PASS:-}" ]; then
+    CONTROL_PASS=$(openssl rand -base64 18)
+    echo "[setup] generated /control password for user '${CONTROL_USER}': ${CONTROL_PASS}"
+    echo "[setup] set CONTROL_USER/CONTROL_PASS env vars to pin this across restarts"
+fi
+printf '%s:%s\n' "$CONTROL_USER" "$(openssl passwd -apr1 "$CONTROL_PASS")" > "$CONTROL_HTPASSWD"
+
+# --- render this container's site config -------------------------------
+envsubst '$DOMAIN' \
+    < "$TEMPLATES/http-site.conf.template" > "$CONF_D/${DOMAIN}.conf"
+
+export UPLOAD_ENABLED SPACES_BUCKET SPACES_PREFIX KEEP_LOCAL_RECORDINGS
+envsubst '$DOMAIN $UPLOAD_ENABLED $SPACES_BUCKET $SPACES_PREFIX $KEEP_LOCAL_RECORDINGS' \
+    < "$TEMPLATES/rtmp-site.conf.template" > "$RTMP_D/${DOMAIN}.conf"
+
+echo "[setup] configured for ${DOMAIN}"
+
+exec "$@"

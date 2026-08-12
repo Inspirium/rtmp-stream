@@ -1,0 +1,7 @@
+.git
+.idea
+.claude
+*.swp
+.env
+.env.*
+!.env.example

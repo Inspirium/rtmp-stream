@@ -1,0 +1,68 @@
+# RTMP ingest for ${DOMAIN}
+#
+# Mint a stream key: docker exec <container> mint-key.sh
+# Publish (encoder / OBS):  rtmp://${DOMAIN}/stream/<playback_id>?key=<stream_key>
+# Playback (HLS):           http://${DOMAIN}/hls/<playback_id>.m3u8
+# Playback (DASH):          http://${DOMAIN}/dash/<playback_id>.mpd
+# Stats:                    http://${DOMAIN}/stat
+# Recording start/stop:     GET /control/record/start?app=stream&name=<playback_id>&rec=rec1[&filename=<name>]
+#                            GET /control/record/stop?app=stream&name=<playback_id>&rec=rec1
+#
+# Every minted stream_key has its own one-way-derived playback_id (see
+# stream_keys.map / mint-key.sh). The encoder's publish path already
+# carries the public playback_id — nginx-rtmp splits off the ?key=...
+# part on its own, so /auth/publish just checks that key is allowed to
+# claim that playback_id (see http-site.conf.template). The secret key
+# itself never becomes the stream's name, so it never appears in
+# HLS/DASH paths, /stat, /control, or recordings, and because each key
+# maps to its own playback_id, this one domain can carry several
+# concurrent streams at once.
+
+server {
+    listen 1935;
+    chunk_size 4096;
+
+    application stream {
+        live on;
+
+        # keep segments aligned to keyframes so HLS/DASH players don't stall
+        wait_key on;
+        wait_video on;
+
+        # validated against stream_keys.map by /auth/publish (see
+        # http-site.conf.template) - the ?key=... query param nginx-rtmp
+        # parses off the publish path is what gets checked
+        on_publish http://127.0.0.1/auth/publish;
+        notify_method get;
+
+        # written flat (no per-app subdir) so they map 1:1 onto the
+        # /hls and /dash http locations, e.g. /hls/<playback_id>.m3u8
+        hls on;
+        hls_path /tmp/hls;
+        hls_fragment 3s;
+        hls_playlist_length 60s;
+        hls_cleanup on;
+
+        dash on;
+        dash_path /tmp/dash;
+        dash_fragment 3s;
+        dash_playlist_length 60s;
+        dash_cleanup on;
+
+        # Recording is manual only (started/stopped via /control, see
+        # above) — nothing is recorded just by publishing. nginx-rtmp
+        # writes the raw copy as flv; exec_record_done hands it to
+        # record-done.sh, which uses ffmpeg to remux it into a seekable
+        # .mp4 (named from ?filename=... if the start call set one, see
+        # record-start.cgi / http-site.conf.template) and uploads it to
+        # object storage if SPACES_* was set up (see docker-entrypoint.sh).
+        recorder rec1 {
+            record all manual;
+            record_suffix -%Y-%m-%d-%H-%M-%S.flv;
+            record_path /tmp/rec;
+            record_unique on;
+
+            exec_record_done /usr/local/bin/record-done.sh $path $name ${DOMAIN} ${UPLOAD_ENABLED} ${SPACES_BUCKET} ${SPACES_PREFIX} ${KEEP_LOCAL_RECORDINGS};
+        }
+    }
+}

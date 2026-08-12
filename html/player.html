@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>RTMP Stream</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html { color-scheme: light dark; }
+  body { max-width: 40em; margin: 2em auto; padding: 0 1em;
+         font-family: -apple-system, Tahoma, Verdana, Arial, sans-serif; }
+  video { width: 100%; background: #000; }
+  input, button { font-size: 1em; padding: .4em; }
+  code { background: rgba(127,127,127,.15); padding: .1em .3em; border-radius: 3px; }
+</style>
+</head>
+<body>
+<h1 id="host-heading">RTMP Stream</h1>
+
+<p>Publish with OBS / an encoder to:<br>
+<code id="publish-url">rtmp://&lt;this host&gt;/stream/&lt;playback id&gt;?key=&lt;your secret stream key&gt;</code></p>
+<p class="muted">The stream key is secret and never shown here — it's printed once in
+<code>docker logs</code> on first start, and again each time you run
+<code>mint-key.sh</code>. It's intentionally different from the playback ID below, so
+a viewer who has this page can't use it to publish over your stream, and each key can
+carry its own concurrent stream.</p>
+
+<p>
+  <label>Playback ID: <input id="key" value="live"></label>
+  <button onclick="load()">Play</button>
+</p>
+
+<video id="video" controls autoplay muted playsinline></video>
+
+<p>
+  <label>Recording filename (optional): <input id="rec-filename" placeholder="auto"></label>
+</p>
+<p>
+  <button id="rec-start" onclick="record('start')">Start Recording</button>
+  <button id="rec-stop" onclick="record('stop')">Stop Recording</button>
+  <span id="rec-status"></span>
+</p>
+<p class="muted">Recording writes a raw .flv, then ffmpeg remuxes it to .mp4 once
+you stop, named from the filename above (letters, digits, <code>._-</code> only) if you
+gave one, otherwise a timestamped default. Files land in <code>/tmp/rec</code>
+(browsable at <a href="/recordings">/recordings</a> once that location is opened up).</p>
+
+<p>Diagnostics: <a href="/stat">/stat</a> (server stats) &middot; <a href="/control">/control</a> (control API)</p>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<script>
+  var video = document.getElementById('video');
+  var hls = null;
+
+  document.getElementById('host-heading').textContent = location.hostname;
+
+  function updatePublishUrl(playbackId) {
+    document.getElementById('publish-url').textContent =
+      'rtmp://' + location.hostname + '/stream/' + playbackId + '?key=<your secret stream key>';
+  }
+  updatePublishUrl('<playback id>');
+
+  function load() {
+    var key = document.getElementById('key').value.trim();
+    if (!key) return;
+    var src = '/hls/' + encodeURIComponent(key) + '.m3u8';
+
+    if (hls) { hls.destroy(); hls = null; }
+
+    if (Hls.isSupported()) {
+      hls = new Hls();
+      hls.loadSource(src);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, function () { video.play(); });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // Safari has native HLS support
+      video.src = src;
+      video.play();
+    } else {
+      alert('This browser cannot play HLS.');
+    }
+  }
+
+  function record(action) {
+    var key = document.getElementById('key').value.trim();
+    var status = document.getElementById('rec-status');
+    if (!key) return;
+
+    var url = '/control/record/' + action
+      + '?app=stream&name=' + encodeURIComponent(key) + '&rec=rec1';
+
+    if (action === 'start') {
+      var filename = document.getElementById('rec-filename').value.trim();
+      if (filename) url += '&filename=' + encodeURIComponent(filename);
+    }
+
+    status.textContent = '...';
+    fetch(url, { method: 'GET' })
+      .then(function (res) {
+        status.textContent = (action === 'start' ? 'recording' : 'stopped')
+          + (res.ok ? '' : ' (' + res.status + ')');
+      })
+      .catch(function () { status.textContent = 'request failed'; });
+  }
+
+  // pre-fill the deployment's actual playback ID (written by
+  // docker-entrypoint.sh); silently keep the "live" default if missing
+  fetch('/playback-id.txt')
+    .then(function (res) { return res.ok ? res.text() : null; })
+    .then(function (id) {
+      if (id) {
+        id = id.trim();
+        document.getElementById('key').value = id;
+        updatePublishUrl(id);
+      }
+      load();
+    })
+    .catch(load);
+</script>
+</body>
+</html>

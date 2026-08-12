@@ -1,0 +1,17 @@
+services:
+  rtmp:
+    build: .
+    image: rtmp-stream:latest
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "80:80"
+      - "443:443"
+      - "1935:1935"
+    volumes:
+      - rec-data:/tmp/rec
+      - key-data:/data
+
+volumes:
+  rec-data:
+  key-data:
