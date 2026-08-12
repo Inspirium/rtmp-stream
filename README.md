@@ -24,6 +24,7 @@ compiled from source in the image.
 - [Security notes](#security-notes)
 - [Project layout](#project-layout)
 - [Troubleshooting](#troubleshooting)
+- [License](#license)
 
 ## Quick start
 
@@ -291,3 +292,7 @@ html/
 - **Recordings not uploading** — check `docker compose logs` for
   `SPACES_*` warnings at startup; a bad endpoint/credential doesn't
   crash the container, it just falls back to local-only recording.
+
+## License
+
+[MIT](LICENSE)
