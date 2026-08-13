@@ -1,13 +1,11 @@
 services:
   rtmp:
     build: .
-    image: rtmp-stream:latest
     restart: unless-stopped
     env_file: .env
     ports:
-      - "80:80"
-      - "443:443"
-      - "1935:1935"
+      - "${HTTP_BIND:-127.0.0.1}:${HTTP_PORT:-8080}:80"
+      - "${RTMP_PORT:-1935}:1935"
     volumes:
       - rec-data:/tmp/rec
       - key-data:/data

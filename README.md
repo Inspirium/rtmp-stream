@@ -18,7 +18,8 @@ compiled from source in the image.
 - [Managing stream keys](#managing-stream-keys)
 - [Recording](#recording)
 - [Object storage (DigitalOcean Spaces / S3)](#object-storage-digitalocean-spaces--s3)
-- [Multiple streams / multiple machines](#multiple-streams--multiple-machines)
+- [Multiple streams / multiple machines / multiple deployments](#multiple-streams--multiple-machines--multiple-deployments)
+  - [Multiple deployments on one machine](#multiple-deployments-on-one-machine)
 - [Monitoring](#monitoring)
 - [Environment variables](#environment-variables)
 - [Security notes](#security-notes)
@@ -196,7 +197,7 @@ recordings local-only. If the endpoint is unreachable or the
 credentials are wrong at container start, the stream still starts
 normally — recordings just stay local until you fix it.
 
-## Multiple streams / multiple machines
+## Multiple streams / multiple machines / multiple deployments
 
 - **One machine, several streams**: mint additional keys (see above).
   Each gets its own playback ID, so each stream gets its own isolated
@@ -206,6 +207,57 @@ normally — recordings just stay local until you fix it.
   machine's own `DOMAIN`, and `docker compose up -d --build`. Nothing
   is shared between machines by default — each has its own key store
   and its own recordings volume.
+- **Several deployments, one machine** (e.g. alongside other services,
+  or several unrelated `DOMAIN`s on the same box): see below.
+
+### Multiple deployments on one machine
+
+By default this container doesn't claim ports 80/443 on the host — its
+plain-HTTP port binds to `127.0.0.1` only (`HTTP_BIND`/`HTTP_PORT` in
+`.env`, default `127.0.0.1:8080`), meant to sit behind a reverse proxy
+you already run for TLS and routing. RTMP (`RTMP_PORT`, default `1935`)
+is a raw TCP protocol, so it can't share that proxy — it's bound
+directly and needs its own port per deployment.
+
+Each deployment gets its own directory (own `.env`, own key store, own
+recordings volume — nothing is shared, same as the multiple-machines
+case above, just on one box):
+
+```sh
+mkdir -p /opt/streams && cd /opt/streams
+
+git clone <this repo> stream1 && cd stream1
+./setup.sh              # DOMAIN=stream1.example.com; HTTP_PORT/RTMP_PORT
+                         # auto-bumped past whatever's already listening
+docker compose up -d --build
+./nginx-vhost.sh | sudo tee /etc/nginx/sites-available/stream1.example.com.conf
+sudo ln -s /etc/nginx/sites-available/stream1.example.com.conf /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot --nginx -d stream1.example.com     # or your usual TLS flow
+sudo ufw allow 1935/tcp                         # RTMP bypasses nginx entirely
+
+cd /opt/streams
+git clone <this repo> stream2 && cd stream2
+./setup.sh               # picks the next free ports, e.g. 8081/1936
+docker compose up -d --build
+./nginx-vhost.sh | sudo tee /etc/nginx/sites-available/stream2.example.com.conf
+# ... same symlink/certbot/ufw steps, with stream2's own port/domain
+```
+
+`nginx-vhost.sh` reads `DOMAIN`/`HTTP_PORT` from that directory's `.env`
+and prints a server block that proxies to the container — including
+`return 403` on `/auth/publish`, `/internal/control/record/start`, and
+`/recordings`. Those paths are meant to be reachable only from
+`127.0.0.1` *inside the container* (see
+[Security notes](#security-notes)); once a host-level proxy forwards to
+the container over `127.0.0.1`, the container can no longer tell a
+proxied internet request apart from a real loopback one, so the block
+has to happen at the proxy instead. Re-run `./nginx-vhost.sh` after
+changing `DOMAIN` or `HTTP_PORT` to regenerate it.
+
+If a machine runs nothing else and you'd rather expose HTTP directly
+without a reverse proxy (the pre-multi-deployment default), set
+`HTTP_BIND=0.0.0.0` in `.env`.
 
 ## Monitoring
 
@@ -223,6 +275,9 @@ worker would be invisible to `/stat` and `/control` on another.
 | Variable | Default | Purpose |
 |---|---|---|
 | `DOMAIN` | *(required)* | Subdomain this container serves |
+| `HTTP_BIND` | `127.0.0.1` | Host interface for `HTTP_PORT`; set `0.0.0.0` to expose HTTP directly with no reverse proxy |
+| `HTTP_PORT` | `8080` | Host port proxied to the container's plain-HTTP port 80 |
+| `RTMP_PORT` | `1935` | Host port for RTMP ingest (always public — RTMP can't go through an HTTP reverse proxy) |
 | `STREAM_KEY` | auto-generated | Seeds one initial stream key on first boot |
 | `ADMIN_API_TOKEN` | auto-generated | Bearer token for `/admin/keys` |
 | `CONTROL_USER` | `admin` | `/control` basic auth username |
@@ -259,6 +314,7 @@ first start. Set them explicitly in `.env` to pin them across restarts.
 Dockerfile                  builds nginx + nginx-rtmp-module + ffmpeg + fcgiwrap
 docker-compose.yml           one service, reads .env
 setup.sh                     interactive .env writer
+nginx-vhost.sh               prints a host nginx server block from .env
 .env.example                 every variable, documented
 
 docker/

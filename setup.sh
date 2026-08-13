@@ -22,11 +22,36 @@ prompt_secret() {
     echo "${value:-$default}"
 }
 
+# Picks $1 if free, otherwise the next free port after it (skipping
+# anything currently LISTENing on the host) - so running this a second
+# time in a sibling directory for another deployment just works, instead
+# of silently colliding with the first one on `docker compose up`.
+next_free_port() {
+    local port=$1
+    if ! command -v ss >/dev/null 2>&1; then
+        echo "$port"
+        return
+    fi
+    while ss -tln 2>/dev/null | grep -q ":$port "; do
+        port=$((port + 1))
+    done
+    echo "$port"
+}
+
 echo "== rtmp-stream setup =="
 echo
 
 DOMAIN=$(prompt "Subdomain for this machine (e.g. stream1.example.com)" "${DOMAIN:-}")
 [ -n "$DOMAIN" ] || { echo "DOMAIN is required" >&2; exit 1; }
+
+echo
+echo "-- ports --"
+echo "   deploying more than one instance on this machine? each needs its"
+echo "   own HTTP_PORT and RTMP_PORT - defaults below are auto-bumped past"
+echo "   whatever's already listening on this host."
+HTTP_PORT=$(prompt "Host HTTP port (behind your reverse proxy)" "$(next_free_port "${HTTP_PORT:-8080}")")
+RTMP_PORT=$(prompt "Host RTMP port (public, for encoders)" "$(next_free_port "${RTMP_PORT:-1935}")")
+HTTP_BIND="${HTTP_BIND:-127.0.0.1}"
 
 echo
 echo "-- initial stream key --"
@@ -71,6 +96,10 @@ fi
 cat > "$ENV_FILE" <<EOF
 DOMAIN=$DOMAIN
 
+HTTP_BIND=$HTTP_BIND
+HTTP_PORT=$HTTP_PORT
+RTMP_PORT=$RTMP_PORT
+
 STREAM_KEY=$STREAM_KEY
 
 SPACES_ENDPOINT=$SPACES_ENDPOINT
@@ -89,5 +118,7 @@ EOF
 chmod 600 "$ENV_FILE"
 
 echo
-echo "wrote $ENV_FILE for $DOMAIN"
-echo "next: docker compose up -d --build"
+echo "wrote $ENV_FILE for $DOMAIN (HTTP_PORT=$HTTP_PORT, RTMP_PORT=$RTMP_PORT)"
+echo "next:"
+echo "  docker compose up -d --build"
+echo "  ./nginx-vhost.sh          # prints an nginx server block for this instance"
