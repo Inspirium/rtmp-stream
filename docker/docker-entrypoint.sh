@@ -6,14 +6,24 @@ set -eu
 : "${DOMAIN:?DOMAIN env var is required, e.g. stream1.example.com}"
 : "${SPACES_PREFIX:=recordings}"
 : "${KEEP_LOCAL_RECORDINGS:=false}"
+: "${TLS_MODE:=proxy}"
 export DOMAIN
+
+case "$TLS_MODE" in
+    proxy|manual|letsencrypt) ;;
+    *)
+        echo "[setup] TLS_MODE must be one of: proxy, manual, letsencrypt (got '$TLS_MODE')" >&2
+        exit 1
+        ;;
+esac
 
 NGINX_PREFIX=/usr/local/nginx
 TEMPLATES=$NGINX_PREFIX/conf/templates
 CONF_D=$NGINX_PREFIX/conf/conf.d
 RTMP_D=$NGINX_PREFIX/conf/rtmp.d
+LOCATIONS_D=$NGINX_PREFIX/conf/site-locations
 
-mkdir -p "$CONF_D" "$RTMP_D" /tmp/rec /tmp/hls /tmp/dash /tmp/rec-pending
+mkdir -p "$CONF_D" "$RTMP_D" "$LOCATIONS_D" /tmp/rec /tmp/hls /tmp/dash /tmp/rec-pending /var/www/certbot
 rm -f "$CONF_D"/*.conf "$RTMP_D"/*.conf
 # nginx workers run as the compiled-in default user, not root - make sure
 # they can write recordings/segments regardless of what that user turns
@@ -129,6 +139,13 @@ fi
 printf '%s:%s\n' "$CONTROL_USER" "$(openssl passwd -apr1 "$CONTROL_PASS")" > "$CONTROL_HTPASSWD"
 
 # --- render this container's site config -------------------------------
+# site-locations holds the location{} blocks shared by the :80 and (if
+# enabled below) :443 server blocks - kept in one file so the security-
+# sensitive `allow 127.0.0.1` locations can't drift between two copies.
+rm -f "$LOCATIONS_D"/*.conf
+envsubst '$DOMAIN' \
+    < "$TEMPLATES/site-locations.conf.template" > "$LOCATIONS_D/${DOMAIN}.conf"
+
 envsubst '$DOMAIN' \
     < "$TEMPLATES/http-site.conf.template" > "$CONF_D/${DOMAIN}.conf"
 
@@ -137,5 +154,73 @@ envsubst '$DOMAIN $UPLOAD_ENABLED $SPACES_BUCKET $SPACES_PREFIX $KEEP_LOCAL_RECO
     < "$TEMPLATES/rtmp-site.conf.template" > "$RTMP_D/${DOMAIN}.conf"
 
 echo "[setup] configured for ${DOMAIN}"
+
+# --- TLS -----------------------------------------------------------------
+# TLS_MODE=proxy (default): nothing to do - terminate TLS in front of this
+#   container (see nginx-vhost.sh / README's "Multiple deployments on one
+#   machine"). No :443 is rendered or listened on.
+# TLS_MODE=manual: bring your own cert - place it (before or after first
+#   start) at /etc/letsencrypt/live/${DOMAIN}/{fullchain,privkey}.pem on
+#   the certs-data volume (see docker-compose.tls.yml), e.g. via
+#   `docker cp`. Rendered as :443 as soon as it's found; no renewal
+#   handling, that's on you.
+# TLS_MODE=letsencrypt: this container requests and renews its own cert
+#   via certbot's webroot plugin. Requires DOMAIN's public DNS to already
+#   point at this machine and port 80 (for the HTTP-01 challenge, before
+#   any cert exists) plus 443 to be reachable from the internet - see
+#   docker-compose.tls.yml.
+CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
+
+if [ "$TLS_MODE" = letsencrypt ] && [ ! -f "$CERT_DIR/fullchain.pem" ]; then
+    : "${LETSENCRYPT_EMAIL:?LETSENCRYPT_EMAIL is required when TLS_MODE=letsencrypt}"
+    echo "[setup] TLS_MODE=letsencrypt: requesting a certificate for ${DOMAIN}"
+    # The HTTP-01 challenge needs something answering :80 for ${DOMAIN}
+    # right now, but the final nginx (started via `exec` below, possibly
+    # with :443 added) isn't up yet - start a short-lived daemonized
+    # nginx with just the :80 config rendered so far, use it to pass the
+    # challenge, then stop it. `exec "$@"` at the bottom always starts
+    # the real, final one.
+    if nginx; then
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            curl -sf "http://127.0.0.1/.well-known/acme-challenge/" >/dev/null 2>&1 && break
+            sleep 0.5
+        done
+        if certbot certonly --webroot -w /var/www/certbot -d "$DOMAIN" \
+            --non-interactive --agree-tos --no-eff-email -m "$LETSENCRYPT_EMAIL"; then
+            echo "[setup] certificate obtained for ${DOMAIN}"
+        else
+            echo "[setup] certbot failed for ${DOMAIN} - staying on HTTP only for now, will retry on next restart" >&2
+        fi
+        nginx -s quit || true
+        # give the temporary master a moment to release :80 before the
+        # real nginx binds it below
+        sleep 1
+    else
+        echo "[setup] temporary nginx (for the ACME challenge) failed to start - staying on HTTP only for now" >&2
+    fi
+fi
+
+if [ "$TLS_MODE" != proxy ] && [ -f "$CERT_DIR/fullchain.pem" ] && [ -f "$CERT_DIR/privkey.pem" ]; then
+    export SSL_CERT_PATH="$CERT_DIR/fullchain.pem"
+    export SSL_CERT_KEY_PATH="$CERT_DIR/privkey.pem"
+    envsubst '$DOMAIN $SSL_CERT_PATH $SSL_CERT_KEY_PATH' \
+        < "$TEMPLATES/https-site.conf.template" > "$CONF_D/${DOMAIN}-ssl.conf"
+    echo "[setup] HTTPS enabled on :443 for ${DOMAIN}"
+elif [ "$TLS_MODE" != proxy ]; then
+    echo "[setup] TLS_MODE=$TLS_MODE but no cert found at ${CERT_DIR} - staying on HTTP only" >&2
+fi
+
+if [ "$TLS_MODE" = letsencrypt ]; then
+    # background renewal loop - certbot no-ops until the cert is actually
+    # due, so a coarse interval is fine. Survives as a child of the real
+    # nginx (started via exec below, same PID, same process tree).
+    (
+        while true; do
+            sleep 12h
+            certbot renew --webroot -w /var/www/certbot --quiet \
+                --deploy-hook "nginx -s reload"
+        done
+    ) &
+fi
 
 exec "$@"

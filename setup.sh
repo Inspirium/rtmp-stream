@@ -54,6 +54,34 @@ RTMP_PORT=$(prompt "Host RTMP port (public, for encoders)" "$(next_free_port "${
 HTTP_BIND="${HTTP_BIND:-127.0.0.1}"
 
 echo
+echo "-- TLS / HTTPS --"
+echo "   proxy       (default) terminate TLS yourself in front of this"
+echo "               container - see nginx-vhost.sh. Nothing to answer below."
+echo "   manual      you supply a cert; this container serves :443 with it."
+echo "   letsencrypt this container gets + renews its own cert via certbot."
+echo "               DOMAIN's DNS must already point here; needs :80 and"
+echo "               :443 reachable from the internet (docker-compose.tls.yml)."
+while :; do
+    TLS_MODE=$(prompt "TLS_MODE (proxy/manual/letsencrypt)" "${TLS_MODE:-proxy}")
+    case "$TLS_MODE" in proxy|manual|letsencrypt) break ;; esac
+    echo "must be one of: proxy, manual, letsencrypt" >&2
+done
+if [ "$TLS_MODE" = letsencrypt ]; then
+    while :; do
+        LETSENCRYPT_EMAIL=$(prompt "Email for Let's Encrypt renewal/expiry notices" "${LETSENCRYPT_EMAIL:-}")
+        [ -n "$LETSENCRYPT_EMAIL" ] && break
+        echo "required for TLS_MODE=letsencrypt" >&2
+    done
+else
+    LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
+fi
+if [ "$TLS_MODE" != proxy ]; then
+    HTTPS_PORT=$(prompt "Host HTTPS port" "${HTTPS_PORT:-443}")
+else
+    HTTPS_PORT="${HTTPS_PORT:-443}"
+fi
+
+echo
 echo "-- initial stream key --"
 echo "   the secret the encoder publishes with. Its playback id (the"
 echo "   public id used in viewer URLs) is derived automatically and"
@@ -100,6 +128,10 @@ HTTP_BIND=$HTTP_BIND
 HTTP_PORT=$HTTP_PORT
 RTMP_PORT=$RTMP_PORT
 
+TLS_MODE=$TLS_MODE
+LETSENCRYPT_EMAIL=$LETSENCRYPT_EMAIL
+HTTPS_PORT=$HTTPS_PORT
+
 STREAM_KEY=$STREAM_KEY
 
 SPACES_ENDPOINT=$SPACES_ENDPOINT
@@ -118,7 +150,16 @@ EOF
 chmod 600 "$ENV_FILE"
 
 echo
-echo "wrote $ENV_FILE for $DOMAIN (HTTP_PORT=$HTTP_PORT, RTMP_PORT=$RTMP_PORT)"
+echo "wrote $ENV_FILE for $DOMAIN (HTTP_PORT=$HTTP_PORT, RTMP_PORT=$RTMP_PORT, TLS_MODE=$TLS_MODE)"
 echo "next:"
-echo "  docker compose up -d --build"
-echo "  ./nginx-vhost.sh          # prints an nginx server block for this instance"
+if [ "$TLS_MODE" = proxy ]; then
+    echo "  docker compose pull && docker compose up -d"
+    echo "  ./nginx-vhost.sh          # prints an nginx server block for this instance"
+else
+    echo "  docker compose -f docker-compose.yml -f docker-compose.tls.yml pull"
+    echo "  docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d"
+    if [ "$TLS_MODE" = manual ]; then
+        echo "  # then docker cp your fullchain.pem/privkey.pem into the container at"
+        echo "  # /etc/letsencrypt/live/$DOMAIN/ (on the certs-data volume) and restart"
+    fi
+fi

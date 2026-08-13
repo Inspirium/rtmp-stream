@@ -18,6 +18,7 @@ compiled from source in the image.
 - [Managing stream keys](#managing-stream-keys)
 - [Recording](#recording)
 - [Object storage (DigitalOcean Spaces / S3)](#object-storage-digitalocean-spaces--s3)
+- [TLS / HTTPS](#tls--https)
 - [Multiple streams / multiple machines / multiple deployments](#multiple-streams--multiple-machines--multiple-deployments)
   - [Multiple deployments on one machine](#multiple-deployments-on-one-machine)
 - [Monitoring](#monitoring)
@@ -62,9 +63,11 @@ and a restart, not a from-source nginx build. To build locally instead
 > `docker login ghcr.io` first on every deployment machine.
 
 Point your DNS for the subdomain you chose at the machine, and open
-ports `80` (HTTP: playback, control, admin API), `443` (HTTPS, once you
-add certs — see [Security notes](#security-notes)), and `1935` (RTMP
-ingest).
+ports `80` (HTTP: playback, control, admin API) and `1935` (RTMP
+ingest). Open `443` too if you're using `TLS_MODE=letsencrypt` or
+`manual` (see [TLS / HTTPS](#tls--https)) — leave it closed if you're
+terminating TLS with a reverse proxy instead (the default,
+`TLS_MODE=proxy`), since that proxy owns 443, not this container.
 
 ## Concepts: stream key vs. playback ID
 
@@ -212,6 +215,31 @@ recordings local-only. If the endpoint is unreachable or the
 credentials are wrong at container start, the stream still starts
 normally — recordings just stay local until you fix it.
 
+## TLS / HTTPS
+
+Set via `TLS_MODE` in `.env` (or via `setup.sh`) — one of:
+
+| `TLS_MODE` | What happens |
+|---|---|
+| `proxy` *(default)* | Nothing — this container only ever serves plain HTTP on `:80`. Terminate TLS yourself in front of it (a reverse proxy already on the machine, a load balancer, ...). `nginx-vhost.sh` prints a ready-to-use nginx server block for this. No `:443` is opened by this container. |
+| `manual` | You supply the cert. Place `fullchain.pem` and `privkey.pem` at `/etc/letsencrypt/live/<DOMAIN>/` on the `certs-data` volume (e.g. `docker cp` them in, before or after first start) and the container serves `:443` with them. No renewal handling — that's on you. |
+| `letsencrypt` | The container requests and renews its own cert via `certbot`'s webroot plugin, no external proxy needed. Requires `LETSENCRYPT_EMAIL`, `DOMAIN`'s public DNS already pointing at this machine, and ports `80`+`443` reachable from the internet (`80` for the HTTP-01 challenge, before any cert exists). Renews automatically in the background; `docker compose logs` shows `[setup] certificate obtained` on success. |
+
+`manual` and `letsencrypt` both need the `:443` publish and a place to
+persist certs across restarts, which live in a separate compose file so
+`TLS_MODE=proxy` deployments (the default) never get `:443` occupied by
+this container:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.tls.yml pull
+docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+```
+
+Certs persist on the `certs-data` volume, so they survive restarts and
+`letsencrypt` won't re-request one it already has. Switching
+`TLS_MODE` back to `proxy` later just stops the `:443` server block
+from being rendered — nothing needs cleaning up.
+
 ## Multiple streams / multiple machines / multiple deployments
 
 - **One machine, several streams**: mint additional keys (see above).
@@ -219,8 +247,9 @@ normally — recordings just stay local until you fix it.
   HLS/DASH output and recordings, all under the same `DOMAIN`.
 - **Several machines**: this whole directory is the image + per-machine
   config surface. Copy it to each machine, run `./setup.sh` with that
-  machine's own `DOMAIN`, and `docker compose up -d --build`. Nothing
-  is shared between machines by default — each has its own key store
+  machine's own `DOMAIN`, and `docker compose pull && docker compose up
+  -d`. Nothing is shared between machines by default — each has its own
+  key store
   and its own recordings volume.
 - **Several deployments, one machine** (e.g. alongside other services,
   or several unrelated `DOMAIN`s on the same box): see below.
@@ -303,6 +332,9 @@ worker would be invisible to `/stat` and `/control` on another.
 | `SPACES_SECRET` | *(unset)* | Secret key |
 | `SPACES_PREFIX` | `recordings` | Key prefix inside the bucket |
 | `KEEP_LOCAL_RECORDINGS` | `false` | Keep local `.flv`/`.mp4` after a successful upload |
+| `TLS_MODE` | `proxy` | `proxy` (external TLS termination), `manual` (bring your own cert), or `letsencrypt` (container manages its own via certbot) — see [TLS / HTTPS](#tls--https) |
+| `LETSENCRYPT_EMAIL` | *(unset)* | Required if `TLS_MODE=letsencrypt`; renewal/expiry notices only |
+| `HTTPS_PORT` | `443` | Host port for HTTPS when `TLS_MODE=manual`/`letsencrypt` (`docker-compose.tls.yml`) |
 
 Auto-generated secrets are printed once, in `docker compose logs`, on
 first start. Set them explicitly in `.env` to pin them across restarts.
@@ -311,9 +343,17 @@ first start. Set them explicitly in `.env` to pin them across restarts.
 
 - Put `DOMAIN` behind HTTPS before relying on this for anything real —
   `ADMIN_API_TOKEN`, `CONTROL_PASS`, and stream keys are all plain
-  secrets on the wire otherwise. There's no built-in ACME/Let's Encrypt
-  automation here; terminate TLS with whatever you already use (a
-  reverse proxy in front, or add a `443 ssl` block yourself).
+  secrets on the wire otherwise. See [TLS / HTTPS](#tls--https): either
+  terminate TLS with a reverse proxy you already run (`TLS_MODE=proxy`,
+  the default), or let this container manage its own cert
+  (`TLS_MODE=letsencrypt`/`manual`).
+- If you're running `TLS_MODE=proxy`, make sure your reverse proxy
+  itself blocks `/auth/publish`, `/internal/control/record/start`, and
+  `/recordings` rather than forwarding them — see `nginx-vhost.sh`. Once
+  a same-host proxy forwards to this container over `127.0.0.1`, the
+  container can no longer distinguish a proxied internet request from a
+  real loopback one, so the `allow 127.0.0.1` below only holds if the
+  proxy itself enforces it too.
 - `/admin/keys` is reachable from anywhere (an external backend needs
   to reach it), gated only by the bearer token — not by an IP
   allow-list. Keep the token secret.
@@ -326,10 +366,11 @@ first start. Set them explicitly in `.env` to pin them across restarts.
 ## Project layout
 
 ```
-Dockerfile                  builds nginx + nginx-rtmp-module + ffmpeg + fcgiwrap
+Dockerfile                  builds nginx + nginx-rtmp-module + ffmpeg + fcgiwrap + certbot
 docker-compose.yml           one service, reads .env
+docker-compose.tls.yml       overlay: :443 + certs-data volume, for TLS_MODE=manual/letsencrypt
 setup.sh                     interactive .env writer
-nginx-vhost.sh               prints a host nginx server block from .env
+nginx-vhost.sh               prints a host nginx server block from .env (TLS_MODE=proxy)
 .env.example                 every variable, documented
 
 .github/workflows/
@@ -338,9 +379,11 @@ nginx-vhost.sh               prints a host nginx server block from .env
 docker/
   nginx.conf                 main nginx config (loads per-domain configs from templates)
   templates/
-    http-site.conf.template  HTTP vhost: HLS/DASH, /control, /admin, /auth/publish, player
-    rtmp-site.conf.template  RTMP ingest app: hls/dash output, recorder
-  docker-entrypoint.sh       renders templates, seeds the key store, starts fcgiwrap, execs nginx
+    site-locations.conf.template  shared locations: HLS/DASH, /control, /admin, /auth/publish, player
+    http-site.conf.template       :80 vhost - ACME challenge + the shared locations
+    https-site.conf.template      :443 vhost (TLS_MODE=manual/letsencrypt only) - same shared locations
+    rtmp-site.conf.template       RTMP ingest app: hls/dash output, recorder
+  docker-entrypoint.sh       renders templates, seeds the key store, starts fcgiwrap, handles TLS_MODE, execs nginx
   mint-key.sh / revoke-key.sh   key management (docker exec)
   admin-api.cgi               key management (HTTP API, POST/DELETE /admin/keys)
   record-start.cgi            captures ?filename=... on record/start
@@ -366,6 +409,13 @@ html/
 - **Recordings not uploading** — check `docker compose logs` for
   `SPACES_*` warnings at startup; a bad endpoint/credential doesn't
   crash the container, it just falls back to local-only recording.
+- **`TLS_MODE=letsencrypt` certificate not issued** — check `docker
+  compose logs` for `certbot failed`; a bad/unreachable-from-internet
+  `DOMAIN` doesn't crash the container, it just stays on HTTP only and
+  retries on the next restart. Common causes: DNS for `DOMAIN` doesn't
+  point at this machine yet, or port `80`/`443` isn't actually reachable
+  from the internet (firewall, or `docker-compose.tls.yml` wasn't
+  included in `up -d`).
 
 ## License
 

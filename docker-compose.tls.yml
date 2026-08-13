@@ -1,0 +1,16 @@
+# Overlay for TLS_MODE=letsencrypt or TLS_MODE=manual (see .env.example) -
+# adds the :443 publish and a volume to persist certs across restarts.
+# Not used at all for the default TLS_MODE=proxy, where a reverse proxy
+# in front of this container owns port 443 instead:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml pull
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+services:
+  rtmp:
+    ports:
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - certs-data:/etc/letsencrypt
+
+volumes:
+  certs-data:

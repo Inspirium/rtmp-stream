@@ -31,7 +31,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libpcre3 zlib1g libssl3 ca-certificates \
         ffmpeg gettext-base openssl curl \
-        fcgiwrap jq util-linux \
+        fcgiwrap jq util-linux certbot \
     && curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc \
         -o /usr/local/bin/mc \
     && chmod +x /usr/local/bin/mc \
@@ -55,13 +55,15 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/record-done.sh \
              /usr/local/bin/mint-key.sh /usr/local/bin/revoke-key.sh \
              /usr/local/bin/admin-api.cgi /usr/local/bin/record-start.cgi \
     && mkdir -p /usr/local/nginx/conf/conf.d /usr/local/nginx/conf/rtmp.d \
-               /tmp/rec /tmp/hls /tmp/dash /tmp/rec-pending /data
+               /usr/local/nginx/conf/site-locations \
+               /tmp/rec /tmp/hls /tmp/dash /tmp/rec-pending /data \
+               /var/www/certbot
 
 ENV PATH="/usr/local/nginx/sbin:${PATH}"
 WORKDIR /usr/local/nginx
 
 EXPOSE 80 443 1935
-VOLUME ["/tmp/rec", "/data"]
+VOLUME ["/tmp/rec", "/data", "/etc/letsencrypt"]
 
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["nginx", "-g", "daemon off;"]

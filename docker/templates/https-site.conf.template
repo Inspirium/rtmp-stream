@@ -1,0 +1,14 @@
+# Rendered only when TLS_MODE is "letsencrypt" or "manual" and a cert
+# was actually found at SSL_CERT_PATH/SSL_CERT_KEY_PATH - see the TLS
+# section of docker-entrypoint.sh. Not rendered at all in the default
+# TLS_MODE=proxy setup, where a reverse proxy in front of this
+# container terminates TLS instead.
+server {
+    listen       443 ssl;
+    server_name  ${DOMAIN};
+
+    ssl_certificate     ${SSL_CERT_PATH};
+    ssl_certificate_key ${SSL_CERT_KEY_PATH};
+
+    include /usr/local/nginx/conf/site-locations/${DOMAIN}.conf;
+}
