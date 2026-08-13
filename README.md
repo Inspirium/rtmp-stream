@@ -35,7 +35,8 @@ On each machine you want to run a stream server:
 git clone <this repo>   # or just copy the directory over
 cd stream
 ./setup.sh              # interactive: subdomain, stream key, Spaces creds, etc.
-docker compose up -d --build
+docker compose pull     # fetch the prebuilt image (fast — skips compiling nginx)
+docker compose up -d
 docker compose logs      # prints the publish URL, playback URL, and any auto-generated secrets
 ```
 
@@ -45,6 +46,20 @@ and backs up the old `.env` first.
 
 If you'd rather configure by hand, copy `.env.example` to `.env` and
 fill it in yourself; every field is commented.
+
+Every push to `master` publishes a fresh image to
+`ghcr.io/inspirium/rtmp-stream` (`.github/workflows/docker-publish.yml`)
+— that's what `docker compose pull` fetches, so a deploy is just a pull
+and a restart, not a from-source nginx build. To build locally instead
+(e.g. testing a Dockerfile change before it's pushed), use
+`docker compose up -d --build`. To pin a specific version instead of
+`latest`, set `IMAGE_TAG=<git-sha-or-vX.Y.Z>` in `.env`.
+
+> **First-time repo setup:** GHCR packages default to private. After the
+> first successful run of `docker-publish.yml`, open the package under
+> the repo's **Packages** tab on GitHub and set its visibility to
+> **Public** — otherwise `docker compose pull` will need a
+> `docker login ghcr.io` first on every deployment machine.
 
 Point your DNS for the subdomain you chose at the machine, and open
 ports `80` (HTTP: playback, control, admin API), `443` (HTTPS, once you
@@ -316,6 +331,9 @@ docker-compose.yml           one service, reads .env
 setup.sh                     interactive .env writer
 nginx-vhost.sh               prints a host nginx server block from .env
 .env.example                 every variable, documented
+
+.github/workflows/
+  docker-publish.yml         builds + pushes the image to GHCR on push to master / version tags
 
 docker/
   nginx.conf                 main nginx config (loads per-domain configs from templates)

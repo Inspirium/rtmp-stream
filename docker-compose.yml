@@ -1,5 +1,12 @@
 services:
   rtmp:
+    # Prebuilt by .github/workflows/docker-publish.yml on every push to
+    # master, since the Dockerfile compiles nginx from source (slow).
+    # Fast deploy path: `docker compose pull && docker compose up -d`.
+    # Building locally (e.g. testing a Dockerfile change) still works
+    # with `docker compose up -d --build`, which overrides this image
+    # tag with a local build of the same name.
+    image: ghcr.io/inspirium/rtmp-stream:${IMAGE_TAG:-latest}
     build: .
     restart: unless-stopped
     env_file: .env
