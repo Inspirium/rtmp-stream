@@ -37,6 +37,17 @@ chmod 1777 /tmp/rec /tmp/hls /tmp/dash
 chmod 777 /tmp/rec-pending
 
 # --- object storage (DigitalOcean Spaces or any S3-compatible endpoint) --
+# mc's config (holds the Spaces secret key) has to live somewhere the
+# *upload* step can also read it: exec_record_done below runs record-done.sh
+# as the nginx worker's unprivileged user (not root), which strips HOME and
+# every other env var except TZ, so the default $HOME/.mc here (root's,
+# mode 700) would be unreachable from there. /data is already the
+# cross-user-writable volume (see stream_keys.map above); MC_CONFIG_DIR
+# pins mc to a spot on it instead, opened up just enough for that worker
+# user to read.
+export MC_CONFIG_DIR=/data/.mc
+mkdir -p "$MC_CONFIG_DIR"
+
 UPLOAD_ENABLED=false
 if [ -n "${SPACES_KEY:-}" ] && [ -n "${SPACES_SECRET:-}" ] \
    && [ -n "${SPACES_BUCKET:-}" ] && [ -n "${SPACES_ENDPOINT:-}" ]; then
@@ -44,6 +55,9 @@ if [ -n "${SPACES_KEY:-}" ] && [ -n "${SPACES_SECRET:-}" ] \
     # back to local-only recording and let the operator fix it later
     if mc alias set spaces "https://${SPACES_ENDPOINT}" "$SPACES_KEY" "$SPACES_SECRET" >/dev/null 2>&1; then
         UPLOAD_ENABLED=true
+        # mc also writes/creates under here at run time (e.g. certs/CAs),
+        # not just config.json - the worker user needs write, not just read
+        chmod -R 777 "$MC_CONFIG_DIR"
         echo "[setup] recordings will be uploaded to spaces/${SPACES_BUCKET}/${SPACES_PREFIX}/${DOMAIN}/"
     else
         echo "[setup] failed to reach SPACES_ENDPOINT (${SPACES_ENDPOINT}) - recordings stay local only, in /tmp/rec" >&2

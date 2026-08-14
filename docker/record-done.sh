@@ -45,6 +45,20 @@ if [ "$UPLOAD_ENABLED" != "true" ]; then
     exit 0
 fi
 
+# exec_record_done runs this as the nginx worker's unprivileged user, not
+# root, with HOME/USER stripped (nginx clears the environment for exec'd
+# children except TZ). mc's alias config lives on the shared /data volume
+# instead of the default $HOME/.mc (see docker-entrypoint.sh), so it's
+# reachable from here too - but MC_CONFIG_DIR alone isn't enough: with no
+# $HOME/$USER, mc's Go runtime falls back to shelling out to `getent` to
+# resolve the user's home directory, and that lookup fails in nginx's exec
+# context (sandboxed/restricted in a way plain `docker exec` isn't) with a
+# misleading "getent: executable file not found in $PATH". Setting HOME
+# and USER explicitly short-circuits that lookup entirely.
+export MC_CONFIG_DIR=/data/.mc
+export HOME=/data/.mc
+export USER=nobody
+
 DEST="spaces/${BUCKET}/${PREFIX}/${DOMAIN}/${BASENAME}"
 
 if mc cp "$MP4_PATH" "$DEST"; then
