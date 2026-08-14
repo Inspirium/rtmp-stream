@@ -55,22 +55,22 @@ if [ "$UPLOAD_ENABLED" != "true" ]; then
 fi
 
 # exec_record_done runs this as the nginx worker's unprivileged user, not
-# root, with HOME/USER stripped (nginx clears the environment for exec'd
-# children except TZ). mc's alias config lives on the shared /data volume
-# instead of the default $HOME/.mc (see docker-entrypoint.sh), so it's
-# reachable from here too - but MC_CONFIG_DIR alone isn't enough: with no
-# $HOME/$USER, mc's Go runtime falls back to shelling out to `getent` to
-# resolve the user's home directory, and that lookup fails in nginx's exec
-# context (sandboxed/restricted in a way plain `docker exec` isn't) with a
-# misleading "getent: executable file not found in $PATH". Setting HOME
-# and USER explicitly short-circuits that lookup entirely.
-export MC_CONFIG_DIR=/data/.mc
-export HOME=/data/.mc
-export USER=nobody
+# root, with every env var but TZ stripped - so the S3 credentials s5cmd
+# needs can't reach it as env vars directly. docker-entrypoint.sh wrote
+# them to this file on the shared /data volume instead; read them back
+# here.
+S3_ENV_FILE=/data/.s3-env
+if [ ! -f "$S3_ENV_FILE" ]; then
+    echo "[record-done] ${S3_ENV_FILE} missing, cannot upload ${BASENAME}" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+. "$S3_ENV_FILE"
+export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 
-DEST="spaces/${BUCKET}/${PREFIX}/${DOMAIN}/${BASENAME}"
+DEST="s3://${BUCKET}/${PREFIX}/${DOMAIN}/${BASENAME}"
 
-if mc cp --quiet "$MP4_PATH" "$DEST"; then
+if s5cmd --endpoint-url "$S3_ENDPOINT_URL" --log error cp "$MP4_PATH" "$DEST" >/dev/null; then
     echo "[record-done] uploaded ${BASENAME} to ${DEST}"
     if [ "$KEEP_LOCAL" != "true" ]; then
         rm -f "$RAW_PATH" "$MP4_PATH"

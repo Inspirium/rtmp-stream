@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 ARG NGINX_VERSION=1.26.2
 ARG RTMP_MODULE_VERSION=1.2.2
+ARG S5CMD_VERSION=2.3.0
 
 FROM debian:bookworm-slim AS build
 ARG NGINX_VERSION
@@ -28,13 +29,13 @@ RUN ./configure \
     && make install
 
 FROM debian:bookworm-slim
+ARG S5CMD_VERSION
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libpcre3 zlib1g libssl3 ca-certificates \
         ffmpeg gettext-base openssl curl \
         fcgiwrap jq util-linux certbot \
-    && curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc \
-        -o /usr/local/bin/mc \
-    && chmod +x /usr/local/bin/mc \
+    && curl -fsSL "https://github.com/peak/s5cmd/releases/download/v${S5CMD_VERSION}/s5cmd_${S5CMD_VERSION}_Linux-64bit.tar.gz" \
+        | tar xz -C /usr/local/bin s5cmd \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /usr/local/nginx /usr/local/nginx
