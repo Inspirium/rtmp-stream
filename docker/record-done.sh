@@ -9,6 +9,15 @@
 # args: <raw_flv_path> <playback_id> <domain> <upload_enabled: true|false> <bucket> <prefix> <keep_local: true|false>
 set -eu
 
+# nginx-rtmp's exec_record_done doesn't forward this script's stdout/
+# stderr into `docker compose logs` - they just go nowhere, and writing
+# directly to PID 1's fds (the usual /proc/1/fd/1 trick) doesn't work
+# either: this runs as the nginx worker's unprivileged user, which can't
+# open root's end of that pipe. Instead, append to a plain log file this
+# user CAN write to; docker-entrypoint.sh tails that file in the
+# background straight into the container's real stdout/stderr.
+exec >>/tmp/record-done.log 2>&1
+
 RAW_PATH=$1
 PLAYBACK_ID=$2
 DOMAIN=$3
@@ -61,7 +70,7 @@ export USER=nobody
 
 DEST="spaces/${BUCKET}/${PREFIX}/${DOMAIN}/${BASENAME}"
 
-if mc cp "$MP4_PATH" "$DEST"; then
+if mc cp --quiet "$MP4_PATH" "$DEST"; then
     echo "[record-done] uploaded ${BASENAME} to ${DEST}"
     if [ "$KEEP_LOCAL" != "true" ]; then
         rm -f "$RAW_PATH" "$MP4_PATH"

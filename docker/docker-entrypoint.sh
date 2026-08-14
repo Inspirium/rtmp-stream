@@ -237,4 +237,16 @@ if [ "$TLS_MODE" = letsencrypt ]; then
     ) &
 fi
 
+# record-done.sh (see there) can't write to nginx's own stdout/stderr -
+# it runs as the nginx worker's unprivileged user via exec_record_done,
+# which can't reach PID 1's fds, and nginx-rtmp doesn't forward exec'd
+# children's output anywhere on its own. It logs to a plain file instead;
+# tail that into this process's own stdout/stderr (still fd 1/2 of the
+# container at this point, before exec below hands them to nginx) so it
+# ends up in `docker compose logs` same as everything else. Forked here,
+# so it keeps running as its own process after exec replaces this shell.
+: >/tmp/record-done.log
+chmod 666 /tmp/record-done.log
+tail -F -n0 /tmp/record-done.log &
+
 exec "$@"
