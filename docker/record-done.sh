@@ -28,6 +28,22 @@ BUCKET=$5
 PREFIX=$6
 KEEP_LOCAL=$7
 
+# Starting a new recording for this playback_id before this script has
+# finished with the previous one (e.g. stop/start called back to back) races
+# two record-done.sh invocations against each other: without this lock, both
+# independently see the target .mp4 name as free (the "don't clobber" check
+# below is a plain [ -e ]) and pick the same path, so whichever ffmpeg finishes
+# last silently overwrites - and uploads over - the other's recording, and (if
+# a webhook is configured) both report "ready" for the same key. Serializing
+# per playback_id here, before that check runs, makes the second invocation
+# see the first's finished file and correctly fall through to the -2 suffix.
+# Held for the rest of the script (through upload) so webhook posts for this
+# playback_id stay ordered too; released automatically when the process exits
+# and fd 9 closes. Scoped per playback_id, not global, so unrelated concurrent
+# streams on this same server don't serialize against each other.
+exec 9>"/tmp/rec-pending/${PLAYBACK_ID}.lock"
+flock -x 9
+
 # exec_record_done runs this as the nginx worker's unprivileged user, not
 # root, with every env var but TZ stripped - so WEBHOOK_URL/WEBHOOK_TOKEN
 # can't reach it as env vars directly, same problem as the S3 credentials
