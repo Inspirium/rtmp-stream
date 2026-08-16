@@ -78,6 +78,24 @@ fi
 : "${SPACES_BUCKET:=-}"
 : "${SPACES_PREFIX:=-}"
 
+# --- video status webhook ------------------------------------------------
+# record-done.sh POSTs {"key","status","size"} to WEBHOOK_URL (Bearer
+# WEBHOOK_TOKEN) once a recording finishes uploading, so a backend can
+# learn the outcome without polling object storage - see record-done.sh
+# and README.md. Same env-stripping problem as the S3 credentials below:
+# write it to a file on /data that the unprivileged worker user can still
+# read. Leave WEBHOOK_URL unset to skip this entirely.
+if [ -n "${WEBHOOK_URL:-}" ]; then
+    cat >/data/.webhook-env <<EOF
+WEBHOOK_URL=$WEBHOOK_URL
+WEBHOOK_TOKEN=${WEBHOOK_TOKEN:-}
+EOF
+    chmod 644 /data/.webhook-env
+    echo "[setup] recording status will be POSTed to ${WEBHOOK_URL}"
+else
+    rm -f /data/.webhook-env
+fi
+
 # --- ingest keys vs playback ids ----------------------------------------
 # stream_keys.map (on the /data volume, so it survives restarts) holds
 # every valid "<stream_key>" playback_id; pair. playback_id is a one-way

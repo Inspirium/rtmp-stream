@@ -103,6 +103,18 @@ else
 fi
 
 echo
+echo "-- status webhook --"
+echo "   record-done.sh POSTs {\"key\",\"status\",\"size\"} here once a recording"
+echo "   finishes uploading, so a backend can learn the outcome without"
+echo "   polling object storage. Leave URL blank to skip."
+WEBHOOK_URL=$(prompt "Webhook URL (blank = disabled)" "${WEBHOOK_URL:-}")
+if [ -n "$WEBHOOK_URL" ]; then
+    WEBHOOK_TOKEN=$(prompt_secret "Webhook bearer token" "${WEBHOOK_TOKEN:-}")
+else
+    WEBHOOK_TOKEN="${WEBHOOK_TOKEN:-}"
+fi
+
+echo
 echo "-- /control API basic auth --"
 echo "   leave password blank to auto-generate one on first start"
 CONTROL_USER=$(prompt "Username" "${CONTROL_USER:-admin}")
@@ -139,6 +151,9 @@ SPACES_BUCKET=$SPACES_BUCKET
 SPACES_KEY=$SPACES_KEY
 SPACES_SECRET=$SPACES_SECRET
 SPACES_PREFIX=$SPACES_PREFIX
+
+WEBHOOK_URL=$WEBHOOK_URL
+WEBHOOK_TOKEN=$WEBHOOK_TOKEN
 
 CONTROL_USER=$CONTROL_USER
 CONTROL_PASS=$CONTROL_PASS
