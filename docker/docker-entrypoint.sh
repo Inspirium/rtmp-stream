@@ -156,6 +156,11 @@ if [ -z "${ADMIN_API_TOKEN:-}" ]; then
     echo "[setup] set ADMIN_API_TOKEN env var to pin this across restarts"
 fi
 export ADMIN_API_TOKEN
+# record-start.cgi (also served via this fcgiwrap) reads these directly
+# to fire the "recording":true half of the camera status webhook - see
+# the "video status webhook" section above and record-start.cgi. Unset
+# is fine; it just no-ops there the same way it does in record-done.sh.
+export WEBHOOK_URL WEBHOOK_TOKEN
 mkdir -p /run
 rm -f /run/fcgiwrap.sock
 fcgiwrap -s unix:/run/fcgiwrap.sock &

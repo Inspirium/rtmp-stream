@@ -218,17 +218,17 @@ normally — recordings just stay local until you fix it.
 
 ## Status webhook
 
-Set `WEBHOOK_URL` in `.env` (or via `setup.sh`) to have `record-done.sh`
-push each recording's outcome to a backend instead of it having to poll
-object storage for the file to show up:
+Set `WEBHOOK_URL` in `.env` (or via `setup.sh`) to have this container
+push status to a backend instead of it having to poll for changes. Two
+independent things get POSTed there, both authenticated the same way:
 
 ```
-WEBHOOK_URL=https://your-backend.example.com/api/webhook/video-status
+WEBHOOK_URL=https://your-backend.example.com/api/webhook/...
 WEBHOOK_TOKEN=...
 ```
 
-Once a recording finishes remuxing and (if object storage is configured)
-uploading, this container POSTs:
+**Recording outcome** (`record-done.sh`) — once a recording finishes
+remuxing and (if object storage is configured) uploading:
 
 ```json
 { "key": "<prefix>/<domain>/<filename>.mp4", "status": "ready", "size": 123456789 }
@@ -238,14 +238,26 @@ or, if ffmpeg failed or the upload didn't make it, `"status": "failed"`
 with no `size`. `key` is exactly what the file lands at in the Space —
 `<prefix>/<domain>/<filename>.mp4`, the same value a backend already
 knows upfront if it set the recording's filename via `?filename=...`
-(see [Recording](#recording)). The request carries
-`Authorization: Bearer <WEBHOOK_TOKEN>` so the receiving backend can
-tell which server sent it; leave `WEBHOOK_TOKEN` blank if the endpoint
-doesn't need one. Nothing is sent if `WEBHOOK_URL` is unset, or for
-recordings kept local-only (no object storage configured) — those never
-reach a "ready" state a remote backend could act on. Delivery is
-fire-and-forget: a failed webhook call is logged (`docker compose
-logs`) but not retried.
+(see [Recording](#recording)). Nothing is sent for recordings kept
+local-only (no object storage configured) — those never reach a "ready"
+state a remote backend could act on.
+
+**Camera recording status** (`record-start.cgi` / `record-done.sh`) —
+whether a given camera (`playback_id`) is currently recording, sent
+`true` the moment `/control/record/start` succeeds and `false` the
+moment the recording actually stops — whether that's an explicit
+`/control/record/stop`, a dropped publisher, or an error partway
+through remuxing/uploading:
+
+```json
+{ "playback_id": "<playback_id>", "recording": true }
+```
+
+Both requests carry `Authorization: Bearer <WEBHOOK_TOKEN>` so the
+receiving backend can tell which server sent them; leave
+`WEBHOOK_TOKEN` blank if the endpoint doesn't need one. Nothing is sent
+at all if `WEBHOOK_URL` is unset. Delivery is fire-and-forget: a failed
+webhook call is logged (`docker compose logs`) but not retried.
 
 ## TLS / HTTPS
 
@@ -364,7 +376,7 @@ worker would be invisible to `/stat` and `/control` on another.
 | `SPACES_SECRET` | *(unset)* | Secret key |
 | `SPACES_PREFIX` | `recordings` | Key prefix inside the bucket |
 | `KEEP_LOCAL_RECORDINGS` | `false` | Keep local `.flv`/`.mp4` after a successful upload |
-| `WEBHOOK_URL` | *(unset)* | Backend endpoint POSTed `{"key","status","size"}` when a recording finishes — see [Status webhook](#status-webhook) |
+| `WEBHOOK_URL` | *(unset)* | Backend endpoint POSTed recording outcomes and camera recording status — see [Status webhook](#status-webhook) |
 | `WEBHOOK_TOKEN` | *(unset)* | Sent as `Authorization: Bearer <token>` on webhook calls |
 | `TLS_MODE` | `proxy` | `proxy` (external TLS termination), `manual` (bring your own cert), or `letsencrypt` (container manages its own via certbot) — see [TLS / HTTPS](#tls--https) |
 | `LETSENCRYPT_EMAIL` | *(unset)* | Required if `TLS_MODE=letsencrypt`; renewal/expiry notices only |
@@ -396,7 +408,8 @@ first start. Set them explicitly in `.env` to pin them across restarts.
   `/internal/control/record/start`) are restricted to `127.0.0.1`.
 - Recording is opt-in per stream — nothing is ever recorded just by
   publishing.
-- `WEBHOOK_TOKEN` is sent outbound to `WEBHOOK_URL` on every recording —
+- `WEBHOOK_TOKEN` is sent outbound to `WEBHOOK_URL` on every recording
+  and every recording start/stop —
   use an `https://` URL or it's a plain secret on the wire, same as the
   others above.
 

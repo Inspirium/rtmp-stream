@@ -104,9 +104,10 @@ fi
 
 echo
 echo "-- status webhook --"
-echo "   record-done.sh POSTs {\"key\",\"status\",\"size\"} here once a recording"
-echo "   finishes uploading, so a backend can learn the outcome without"
-echo "   polling object storage. Leave URL blank to skip."
+echo "   POSTed here so a backend doesn't have to poll: recording outcome"
+echo "   ({\"key\",\"status\",\"size\"}) once a recording finishes uploading,"
+echo "   and camera recording status ({\"playback_id\",\"recording\"}) on"
+echo "   every start/stop. Leave URL blank to skip both."
 WEBHOOK_URL=$(prompt "Webhook URL (blank = disabled)" "${WEBHOOK_URL:-}")
 if [ -n "$WEBHOOK_URL" ]; then
     WEBHOOK_TOKEN=$(prompt_secret "Webhook bearer token" "${WEBHOOK_TOKEN:-}")

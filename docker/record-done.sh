@@ -6,7 +6,8 @@
 # and, if object storage was configured, uploads it and cleans up the
 # local copies. If a status webhook was configured, also POSTs the
 # outcome (ready/failed) so a backend doesn't have to poll object
-# storage to find out (see WEBHOOK_URL in README.md).
+# storage to find out, and tells it this camera has stopped recording
+# (see WEBHOOK_URL in README.md).
 #
 # args: <raw_flv_path> <playback_id> <domain> <upload_enabled: true|false> <bucket> <prefix> <keep_local: true|false>
 set -eu
@@ -51,6 +52,30 @@ flock -x 9
 # volume instead.
 WEBHOOK_ENV_FILE=/data/.webhook-env
 WEBHOOK_SENT=0
+
+# POSTs {"playback_id","recording":false} to WEBHOOK_URL, authenticated
+# as this server - the other half of record-start.cgi's matching
+# "recording":true call. Fired unconditionally, before anything below
+# that can fail (ffmpeg, upload) - this camera really has stopped
+# recording the moment exec_record_done invokes this script, regardless
+# of what happens to the file afterwards. No-op if no webhook configured.
+send_camera_webhook() {
+    [ -f "$WEBHOOK_ENV_FILE" ] || return 0
+    # shellcheck disable=SC1090
+    . "$WEBHOOK_ENV_FILE"
+    [ -n "${WEBHOOK_URL:-}" ] || return 0
+
+    if curl -sf -m 10 -X POST "$WEBHOOK_URL" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer ${WEBHOOK_TOKEN:-}" \
+        -d "$(printf '{"playback_id":"%s","recording":false}' "$PLAYBACK_ID")" \
+        >/dev/null; then
+        echo "[record-done] camera webhook notified: recording=false playback_id=${PLAYBACK_ID}"
+    else
+        echo "[record-done] camera webhook call FAILED for playback_id=${PLAYBACK_ID}" >&2
+    fi
+}
+send_camera_webhook
 
 # POSTs {"key", "status", "size"?} to WEBHOOK_URL, authenticated as this
 # server (Bearer WEBHOOK_TOKEN) so VideoStatusWebhookController can look
