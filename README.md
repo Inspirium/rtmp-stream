@@ -292,39 +292,89 @@ normally — recordings just stay local until you fix it.
 ## Status webhook
 
 Set `WEBHOOK_URL` in `.env` (or via `setup.sh`) to have this container
-push status to a backend instead of it having to poll for changes. Two
-independent things get POSTed there, both authenticated the same way:
+push status to a backend instead of it having to poll for changes. Three
+independent things get POSTed there, all authenticated the same way:
 
 ```
 WEBHOOK_URL=https://your-backend.example.com/api/webhook/...
 WEBHOOK_TOKEN=...
 ```
 
-**Recording outcome** (`record-done.sh`) — once a recording finishes
-remuxing and (if object storage is configured) uploading:
+**Recording outcome** (`rec-finalize.sh`) — once a recording finishes
+joining and (if object storage is configured) uploading:
 
 ```json
-{ "key": "<prefix>/<domain>/<filename>.mp4", "status": "ready", "size": 123456789 }
+{
+  "key": "<prefix>/<domain>/<filename>.mp4",
+  "status": "ready",
+  "size": 123456789,
+  "gaps": []
+}
 ```
 
 or, if ffmpeg failed or the upload didn't make it, `"status": "failed"`
-with no `size`. `key` is exactly what the file lands at in the Space —
+with no `size` and no `gaps`. `key` is exactly what the file lands at in the Space —
 `<prefix>/<domain>/<filename>.mp4`, the same value a backend already
 knows upfront if it set the recording's filename via `?filename=...`
 (see [Recording](#recording)). Nothing is sent for recordings kept
 local-only (no object storage configured) — those never reach a "ready"
 state a remote backend could act on.
 
-**Camera recording status** (`record-start.cgi` / `record-done.sh`) —
+**Camera recording status** (`record-start.cgi` / `rec-finalize.sh`) —
 whether a given camera (`playback_id`) is currently recording, sent
-`true` the moment `/control/record/start` succeeds and `false` the
-moment the recording actually stops — whether that's an explicit
-`/control/record/stop`, a dropped publisher, or an error partway
-through remuxing/uploading:
+`true` the moment `/control/record/start` is accepted and `false` when
+the recording session ends: an explicit `/control/record/stop`, the
+publisher staying away past `RESUME_TIMEOUT`, or an error partway
+through joining/uploading.
 
 ```json
 { "playback_id": "<playback_id>", "recording": true }
 ```
+
+A publisher dropping out mid-recording does **not** send `false` — the
+recording resumes when the encoder reconnects (see [Reconnects and
+resumed recordings](#reconnects-and-resumed-recordings)), so exactly one
+`true`/`false` pair is sent per booking however many times the stream
+drops.
+
+**Recording gaps** (`record-resume.sh`) — the stretches of a booking
+with no footage, because the publisher was away. The joined `.mp4` is
+continuous and says nothing about them, so they're reported explicitly,
+one message per gap, the moment the encoder comes back:
+
+```json
+{
+  "playback_id": "<playback_id>",
+  "event": "gap",
+  "started_at": 1788627540,
+  "ended_at": 1788627548,
+  "seconds": 8
+}
+```
+
+The same gaps arrive again in that recording's `ready` message, as the
+`gaps` array, each with an `offset` — how many seconds of footage
+precede it in the finished file, so a gap can be marked on the video's
+own timeline rather than just counted:
+
+```json
+"gaps": [
+  { "started_at": 1788627540, "ended_at": 1788627548, "seconds": 8, "offset": 9.533 },
+  { "started_at": 1788627556, "ended_at": 1788627562, "seconds": 6, "offset": 16.937 }
+]
+```
+
+Timestamps are Unix epoch seconds, so UTC by definition. Since delivery
+isn't retried (see below), treat the `gaps` array as the authoritative
+list and the live messages as the ones you can act on during a booking;
+a gap can be missed live but never duplicated, so dedupe on
+`(playback_id, started_at)` if you consume both.
+
+A gap the camera never came back from appears only in the `gaps` array
+— there was no reconnect to announce it live — and it matters: a backend
+that stamps the end of its coverage from `"recording": false` gets a
+timestamp up to `RESUME_TIMEOUT` after the last frame was actually
+written, and that trailing gap is what tells it so.
 
 Both requests carry `Authorization: Bearer <WEBHOOK_TOKEN>` so the
 receiving backend can tell which server sent them; leave

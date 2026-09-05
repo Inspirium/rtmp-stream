@@ -23,6 +23,38 @@ finalize_session() {
     # any of the parts that can fail
     send_camera_status "$_id" false
 
+    # A gap still open at this point never closed: the publisher went away
+    # and the session is ending without it ever coming back - RESUME_TIMEOUT
+    # expiring, or a stop called while the camera was still offline.
+    #
+    # The recording simply stops there, but a backend stamps the end of its
+    # coverage from the "recording":false above, which is NOW - up to
+    # RESUME_TIMEOUT after the last frame was actually written. Left
+    # unreported it would believe it holds footage for that tail and skip
+    # repairing it. So close the gap out and report it like any other; it
+    # lands at the very end of the file, which is exactly where the footage
+    # stops.
+    _open=$(session_get "$_id" gap_open)
+    case "$_open" in
+        ''|*[!0-9]*) ;;
+        *)
+            _now=$(date +%s)
+            session_unset "$_id" gap_open
+            if [ "$((_now - _open))" -le 0 ]; then
+                # stopped in the same second the publisher went away: no
+                # footage is actually missing, and a zero-length gap is just
+                # a row for a backend to store and subtract nothing from
+                rec_log "session ${_id}: ended as the publisher went away, no footage missing"
+            else
+                _all=$(session_parts "$_id" | grep -c . 2>/dev/null || true)
+                : "${_all:=0}"
+                printf '%s %s %s\n' "$_open" "$_now" "$_all" >>"$(session_dir "$_id")/gaps" 2>/dev/null || true
+                chmod 666 "$(session_dir "$_id")/gaps" 2>/dev/null || true
+                rec_log "session ${_id}: ended with the publisher still away - trailing gap of $((_now - _open))s"
+            fi
+            ;;
+    esac
+
     # Did the publisher drop at any point? Only then is it worth measuring
     # each part, which costs an ffprobe apiece - the common case is one
     # unbroken part and no measuring at all.
@@ -167,11 +199,14 @@ target_taken() {
 #
 #   [{"started_at":1788623712,"ended_at":1788623717,"seconds":5,"offset":6.533}]
 #
-# started_at/ended_at are wall clock, the same values already reported live
-# when the publisher came back. `offset` is where the gap sits in the
-# joined .mp4 - the total footage recorded before it - which is what lets a
+# started_at/ended_at are wall clock. Every gap here that closed on a
+# reconnect was also reported live at the time; a trailing gap - one the
+# publisher never came back from - appears only here, since there was no
+# reconnect to announce it. `offset` is where the gap sits in the joined
+# .mp4 - the total footage recorded before it - which is what lets a
 # backend mark it on a timeline rather than just say "8 minutes are
-# missing somewhere". Empty array when the recording ran unbroken.
+# missing somewhere"; a trailing gap's offset is therefore the full
+# duration. Empty array when the recording ran unbroken.
 #
 # usage: gaps_json <playback_id> <parts.meta>
 gaps_json() {

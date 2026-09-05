@@ -197,9 +197,13 @@ send_camera_status() {
 # again in the final "ready" payload with each gap's offset into the
 # finished file (see rec-finalize.sh).
 #
-# A gap that never closes - the camera didn't come back at all - is not
-# one of these. The recording simply ends there, which the shorter
-# duration and the "recording":false already say.
+# A gap the publisher never came back from is reported too, but only in
+# that final payload - there was no reconnect to announce it live. It's
+# added by rec-finalize.sh when a session ends with one still open, and
+# matters more than it looks: a backend stamps the end of its coverage
+# from the "recording":false, which lands up to RESUME_TIMEOUT after the
+# last frame was written, so without it that tail looks like footage
+# we hold.
 
 gap_open() { session_set "$1" gap_open "$(date +%s)"; }
 
