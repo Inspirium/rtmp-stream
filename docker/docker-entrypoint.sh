@@ -132,6 +132,38 @@ chmod 777 /data/rec-sessions
 RESUMABLE=0
 for _s in /data/rec-sessions/*; do
     [ -d "$_s" ] || continue
+    _id=$(basename "$_s")
+    _was_recording=$(cat "$_s/recording" 2>/dev/null || echo 0)
+    _last_seen=$(cat "$_s/updated" 2>/dev/null || echo "")
+
+    # A recording that was open when this container went down never got its
+    # exec_record_done, so nothing ever banked its .flv as a part of the
+    # session - it just sits in /tmp/rec unreferenced, and the join at stop
+    # time would silently leave it out. Adopt the ones that clearly belong
+    # to this session: same playback_id, non-empty, and written after the
+    # session opened. The glob sorts by the epoch nginx-rtmp puts in the
+    # name, so they arrive in the order they were recorded.
+    if [ -f "$_s/started" ]; then
+        for _f in /tmp/rec/"${_id}"-*.flv; do
+            [ -s "$_f" ] || continue
+            [ -n "$(find "$_f" -newermt "@$(cat "$_s/started")" 2>/dev/null)" ] || continue
+            if grep -qxF "$_f" "$_s/parts" 2>/dev/null; then
+                continue
+            fi
+            printf '%s\n' "$_f" >>"$_s/parts"
+            echo "[setup] recovered $(basename "$_f") into session ${_id}"
+        done
+    fi
+
+    # That interruption is a gap in the booking like any other, so report it
+    # as one. The last thing the session recorded before going down is the
+    # closest we have to when the footage actually stopped - the container
+    # was already gone by the time anything could have noticed.
+    if [ "$_was_recording" = 1 ] && [ -n "$_last_seen" ]; then
+        printf '%s' "$_last_seen" >"$_s/gap_open" 2>/dev/null || true
+        chmod 666 "$_s/gap_open" 2>/dev/null || true
+    fi
+
     printf '0' >"$_s/recording" 2>/dev/null || true
     printf '%s' "$(date +%s)" >"$_s/updated" 2>/dev/null || true
     chmod 666 "$_s/recording" "$_s/updated" 2>/dev/null || true

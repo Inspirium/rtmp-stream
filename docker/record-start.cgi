@@ -62,18 +62,37 @@ session_create "$NAME" "$FILENAME"
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
     "http://127.0.0.1/internal/control/record/start?app=${APP}&name=${NAME}&rec=${REC}")
 
+# nginx-rtmp answers 200 only when it actually opened a recorder, and 204
+# when there was no live stream of that name to record - which happens for
+# a genuine typo, but far more often because the booking started a moment
+# before the camera finished connecting.
 case "$STATUS" in
-    2??)
+    200)
         session_set "$NAME" recording 1
         rec_log "session ${NAME}: recording started${FILENAME:+ as ${FILENAME}.mp4}"
         send_camera_status "$NAME" true
+        respond "$STATUS"
         ;;
-    *)
-        # nothing is recording, so don't leave a session behind for
-        # record-resume.sh to act on the next time this stream publishes
-        session_destroy "$NAME"
-        rec_log "session ${NAME}: record/start refused by nginx-rtmp (status ${STATUS})"
+    204)
+        # Leave the session open with recording=0 rather than throwing it
+        # away. This is exactly the state a session is in between a drop
+        # and a reconnect, so exec_publish/record-resume.sh will start
+        # recording the instant the camera turns up - which is what the
+        # caller asked for, just a few seconds later than it asked.
+        #
+        # If the camera never turns up, session-watchdog.sh closes this out
+        # after RESUME_TIMEOUT and reports it as failed, so an armed
+        # session can't linger for a stream that will never exist.
+        rec_log "session ${NAME}: nothing publishing yet, armed${FILENAME:+ for ${FILENAME}.mp4} - recording starts when the camera connects"
+        send_camera_status "$NAME" true
+        # 202: accepted, not yet recording - distinguishable from the 200
+        # above, and still a 2xx for callers that only check for success
+        respond "202 Accepted"
         ;;
 esac
 
+# anything else really is a refusal - don't leave a session behind for
+# record-resume.sh to act on the next time this stream publishes
+session_destroy "$NAME"
+rec_log "session ${NAME}: record/start refused by nginx-rtmp (status ${STATUS})"
 respond "$STATUS"

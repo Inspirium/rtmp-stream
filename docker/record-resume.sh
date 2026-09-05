@@ -52,9 +52,14 @@ while [ "$i" -le 10 ]; do
         2>/dev/null || echo 000)
     case "$STATUS" in
         2??)
+            # close the gap BEFORE flipping `recording`, so the gap length
+            # measures time without footage rather than time without a
+            # publisher - the two differ by however long this retry loop
+            # took to get the recorder open again
+            GAP=$(gap_close "$PLAYBACK_ID")
             session_set "$PLAYBACK_ID" recording 1
             PARTS=$(session_parts "$PLAYBACK_ID" | grep -c . || true)
-            rec_log "session ${PLAYBACK_ID}: publisher reconnected, recording resumed (part $((PARTS + 1)))"
+            rec_log "session ${PLAYBACK_ID}: publisher reconnected, recording resumed (part $((PARTS + 1)))${GAP:+, ${GAP}s of footage missing}"
             exit 0
             ;;
     esac

@@ -63,6 +63,7 @@ case "$STATE" in
         # "recording":false, no video status - as far as the booking is
         # concerned this recording is still running, and it will be again
         # within a second or two of the encoder reconnecting.
+        gap_open "$PLAYBACK_ID"
         rec_log "session ${PLAYBACK_ID}: publisher went away, part kept ($(basename "$RAW_PATH")) - waiting for reconnect"
         ;;
     stopping)

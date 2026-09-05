@@ -101,9 +101,12 @@ session_create() {
     session_set "$1" name "$2"
     session_set "$1" state active
     session_set "$1" recording 0
+    session_set "$1" started "$(date +%s)"
 }
 
 session_destroy() { rm -rf "$(session_dir "$1")" 2>/dev/null || true; }
+
+session_unset() { rm -f "$(session_dir "$1")/$2" 2>/dev/null || true; }
 
 session_add_part() {
     _d=$(session_dir "$1")
@@ -178,4 +181,63 @@ send_camera_status() {
     else
         rec_log "camera webhook FAILED: recording=$2 playback_id=$1"
     fi
+}
+
+# --- gaps ---------------------------------------------------------------
+# A gap is the stretch of a booking that has no footage because the
+# publisher was away: it opens when a part closes early (record-done.sh
+# with the session still active) and closes when the encoder comes back
+# (record-resume.sh). The joined-up .mp4 is continuous, so nothing in the
+# file itself says a gap is there - the backend has to be told, or it will
+# show a 60-minute booking as a 52-minute video with no explanation.
+#
+# Recorded as one line per closed gap in the session's `gaps` file:
+#   <started_at> <ended_at> <parts recorded before it>
+# and reported twice: once live, the moment the publisher returns, and
+# again in the final "ready" payload with each gap's offset into the
+# finished file (see rec-finalize.sh).
+#
+# A gap that never closes - the camera didn't come back at all - is not
+# one of these. The recording simply ends there, which the shorter
+# duration and the "recording":false already say.
+
+gap_open() { session_set "$1" gap_open "$(date +%s)"; }
+
+# usage: gap_close <playback_id>; echoes the gap length in seconds, or
+# nothing at all if no gap was open
+gap_close() {
+    _started=$(session_get "$1" gap_open)
+    if [ -z "$_started" ]; then
+        # No gap on record: this session was mid-recording when the
+        # container went down, so record-done.sh never ran to open one.
+        # docker-entrypoint.sh seeds gap_open from the session's last
+        # known activity in that case, so reaching here means there
+        # genuinely wasn't one.
+        return 0
+    fi
+    case "$_started" in ''|*[!0-9]*) session_unset "$1" gap_open; return 0 ;; esac
+
+    _ended=$(date +%s)
+    _secs=$((_ended - _started))
+    [ "$_secs" -ge 0 ] || _secs=0
+    _before=$(session_parts "$1" | grep -c . 2>/dev/null || true)
+    : "${_before:=0}"
+
+    printf '%s %s %s\n' "$_started" "$_ended" "$_before" >>"$(session_dir "$1")/gaps" 2>/dev/null || true
+    chmod 666 "$(session_dir "$1")/gaps" 2>/dev/null || true
+    session_unset "$1" gap_open
+
+    if webhook_post "$(printf '{"playback_id":"%s","event":"gap","started_at":%s,"ended_at":%s,"seconds":%s}' \
+            "$1" "$_started" "$_ended" "$_secs")"; then
+        rec_log "gap webhook notified: ${_secs}s gap on ${1}"
+    else
+        rec_log "gap webhook FAILED: ${_secs}s gap on ${1}"
+    fi
+    printf '%s' "$_secs"
+}
+
+session_gaps() {
+    _f=$(session_dir "$1")/gaps
+    [ -f "$_f" ] || return 0
+    cat "$_f" 2>/dev/null || true
 }
