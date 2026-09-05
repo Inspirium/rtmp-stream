@@ -7,6 +7,11 @@ set -eu
 : "${SPACES_PREFIX:=recordings}"
 : "${KEEP_LOCAL_RECORDINGS:=false}"
 : "${TLS_MODE:=proxy}"
+# how long a booking waits for a dropped publisher to come back before
+# session-watchdog.sh gives up and uploads what it has anyway
+: "${RESUME_TIMEOUT:=600}"
+: "${CLEANUP_INTERVAL:=3600}"
+: "${RECORDING_RETENTION_DAYS:=7}"
 export DOMAIN
 
 case "$TLS_MODE" in
@@ -73,8 +78,6 @@ EOF
 else
     echo "[setup] SPACES_ENDPOINT/SPACES_BUCKET/SPACES_KEY/SPACES_SECRET not all set - recordings stay local only, in /tmp/rec"
 fi
-# non-empty placeholders: an empty token here would shift the positional
-# args nginx passes to record-done.sh via exec_record_done
 : "${SPACES_BUCKET:=-}"
 : "${SPACES_PREFIX:=-}"
 
@@ -95,6 +98,48 @@ EOF
 else
     rm -f /data/.webhook-env
 fi
+
+# --- recording sessions --------------------------------------------------
+# The scripts nginx-rtmp spawns (record-done.sh, record-resume.sh) run as
+# the worker's unprivileged user with every env var but TZ stripped, so
+# they can't read any of the settings resolved above. Write the ones they
+# need to a file on /data, the same trick as the S3 credentials.
+cat >/data/.rec-config <<EOF
+DOMAIN=$DOMAIN
+UPLOAD_ENABLED=$UPLOAD_ENABLED
+SPACES_BUCKET=$SPACES_BUCKET
+SPACES_PREFIX=$SPACES_PREFIX
+KEEP_LOCAL_RECORDINGS=$KEEP_LOCAL_RECORDINGS
+RESUME_TIMEOUT=$RESUME_TIMEOUT
+RECORDING_RETENTION_DAYS=$RECORDING_RETENTION_DAYS
+REC_DIR=/tmp/rec
+RTMP_APP=stream
+EOF
+chmod 644 /data/.rec-config
+
+# Session state lives here rather than /tmp precisely so it survives this
+# restart: a booking interrupted by `docker compose up -d` picks up again
+# the moment its encoder reconnects (see rec-session.sh). 777 because both
+# root (via fcgiwrap) and the nginx worker user write it.
+mkdir -p /data/rec-sessions
+chmod 777 /data/rec-sessions
+
+# Nothing is recording yet - nginx hasn't started. Any session that was
+# mid-recording when this container went down still says so, and
+# record-resume.sh skips a session it believes is already recording, which
+# would leave the booking stuck. Clear the flag and restart the watchdog's
+# idle clock so a slow boot isn't counted against RESUME_TIMEOUT.
+RESUMABLE=0
+for _s in /data/rec-sessions/*; do
+    [ -d "$_s" ] || continue
+    printf '0' >"$_s/recording" 2>/dev/null || true
+    printf '%s' "$(date +%s)" >"$_s/updated" 2>/dev/null || true
+    chmod 666 "$_s/recording" "$_s/updated" 2>/dev/null || true
+    if [ "$(cat "$_s/state" 2>/dev/null)" = active ]; then
+        RESUMABLE=$((RESUMABLE + 1))
+    fi
+done
+[ "$RESUMABLE" -eq 0 ] ||     echo "[setup] ${RESUMABLE} recording session(s) still open - they resume when their encoders reconnect"
 
 # --- ingest keys vs playback ids ----------------------------------------
 # stream_keys.map (on the /data volume, so it survives restarts) holds
@@ -156,11 +201,6 @@ if [ -z "${ADMIN_API_TOKEN:-}" ]; then
     echo "[setup] set ADMIN_API_TOKEN env var to pin this across restarts"
 fi
 export ADMIN_API_TOKEN
-# record-start.cgi (also served via this fcgiwrap) reads these directly
-# to fire the "recording":true half of the camera status webhook - see
-# the "video status webhook" section above and record-start.cgi. Unset
-# is fine; it just no-ops there the same way it does in record-done.sh.
-export WEBHOOK_URL WEBHOOK_TOKEN
 mkdir -p /run
 rm -f /run/fcgiwrap.sock
 fcgiwrap -s unix:/run/fcgiwrap.sock &
@@ -194,8 +234,7 @@ envsubst '$DOMAIN' \
 envsubst '$DOMAIN' \
     < "$TEMPLATES/http-site.conf.template" > "$CONF_D/${DOMAIN}.conf"
 
-export UPLOAD_ENABLED SPACES_BUCKET SPACES_PREFIX KEEP_LOCAL_RECORDINGS
-envsubst '$DOMAIN $UPLOAD_ENABLED $SPACES_BUCKET $SPACES_PREFIX $KEEP_LOCAL_RECORDINGS' \
+envsubst '$DOMAIN' \
     < "$TEMPLATES/rtmp-site.conf.template" > "$RTMP_D/${DOMAIN}.conf"
 
 echo "[setup] configured for ${DOMAIN}"
@@ -279,5 +318,22 @@ fi
 : >/tmp/record-done.log
 chmod 666 /tmp/record-done.log
 tail -F -n0 /tmp/record-done.log &
+
+# A booking whose camera never comes back would otherwise keep its session
+# (and its parts) forever, with the backend waiting on a recording that
+# never arrives - this finalizes it after RESUME_TIMEOUT. Forked here so it
+# outlives the exec below, same as the certbot loop above.
+session-watchdog.sh &
+
+# Keeps the recordings volume from filling up with the leftovers of
+# recordings that failed to upload or were killed mid-write. Conservative
+# by default: see cleanup-recordings.sh for what it will and won't remove.
+(
+    while true; do
+        sleep "$CLEANUP_INTERVAL"
+        cleanup-recordings.sh --quiet >>/tmp/record-done.log 2>&1 || true
+    done
+) &
+echo "[setup] recordings volume swept every ${CLEANUP_INTERVAL}s (retention ${RECORDING_RETENTION_DAYS}d)"
 
 exec "$@"

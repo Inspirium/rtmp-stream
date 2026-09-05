@@ -17,6 +17,8 @@ compiled from source in the image.
 - [Playback](#playback)
 - [Managing stream keys](#managing-stream-keys)
 - [Recording](#recording)
+  - [Reconnects and resumed recordings](#reconnects-and-resumed-recordings)
+  - [Disk housekeeping](#disk-housekeeping)
 - [Object storage (DigitalOcean Spaces / S3)](#object-storage-digitalocean-spaces--s3)
 - [Status webhook](#status-webhook)
 - [TLS / HTTPS](#tls--https)
@@ -197,6 +199,77 @@ under `/tmp/rec` in the container (the `rec-data` volume), browsable at
 `http://<DOMAIN>/recordings/` — closed to everything but `127.0.0.1` by
 default, since these are full recorded videos.
 
+### Reconnects and resumed recordings
+
+A recording is not tied to a single RTMP connection. Everything between
+one `record/start` and its matching `record/stop` is a **session**, and a
+session survives the publisher going away: when the encoder reconnects,
+recording picks up on its own within a second or so.
+
+This matters more than it sounds. nginx-rtmp closes the `.flv` the
+moment a publisher disconnects and cannot reopen it, and recording is
+manual-only — so without this, a two-second blip on the venue's uplink
+silently ended the recording, and the remaining hour of the booking was
+never written at all.
+
+Because the file can't be reopened, a session that outlives a reconnect
+is recorded as several parts. They're concatenated with ffmpeg (again
+`-c copy`) into **one** `.mp4` when the session stops, under the name
+the start call asked for — so a caller that requested
+`filename=board_meeting_2026` gets exactly one
+`board_meeting_2026.mp4`, whether the stream dropped zero times or five.
+The status webhook behaves the same way: one `"recording":true` at
+start, one `"recording":false` at stop, and a single `ready` for the
+finished file. Drops in between are not reported, because nothing about
+the booking has actually stopped.
+
+Two cases don't end in a reconnect, and both are handled:
+
+- **The camera never comes back.** After `RESUME_TIMEOUT` seconds
+  (default 600) the session is finalized anyway — the footage recorded
+  up to the drop is joined, uploaded and reported, exactly as if you had
+  called `record/stop`.
+- **You stop a booking while its camera is offline.** There's no
+  recorder for nginx-rtmp to close, so `record/stop` finalizes the
+  banked parts itself and returns `200`.
+
+Sessions live on the `/data` volume, so they also survive the container
+being restarted mid-booking: `docker compose up -d` to change a setting
+no longer costs you the recording, it just becomes another part.
+
+To see what's currently open, and to force one to finish early:
+
+```sh
+docker exec <container> ls /data/rec-sessions
+docker exec <container> record-finalize.sh <playback_id>
+```
+
+### Disk housekeeping
+
+Recordings are deleted locally as soon as their upload is confirmed
+(unless `KEEP_LOCAL_RECORDINGS=true`), so `/tmp/rec` normally stays
+near-empty. What accumulates is the wreckage of the times that didn't
+work — a container killed mid-recording, an upload that failed against
+credentials that had just changed, a publisher that connected and never
+sent a keyframe.
+
+A sweep runs every `CLEANUP_INTERVAL` seconds (default hourly) and can
+also be run by hand:
+
+```sh
+docker exec <container> cleanup-recordings.sh --dry-run
+docker exec <container> cleanup-recordings.sh --older-than 3
+docker exec <container> cleanup-recordings.sh --force
+```
+
+By default it only deletes what it can prove is disposable: zero-byte
+recordings over a day old, and files past `RECORDING_RETENTION_DAYS`
+(default 7) whose upload it can confirm by listing the bucket. Anything
+older than the window that is *not* in object storage is footage that
+never left the machine — that gets reported and kept until you pass
+`--force`. Parts of a session that's still open, and anything written in
+the last few minutes, are never touched at either setting.
+
 ## Object storage (DigitalOcean Spaces / S3)
 
 Set in `.env` (or via `setup.sh`):
@@ -376,6 +449,9 @@ worker would be invisible to `/stat` and `/control` on another.
 | `SPACES_SECRET` | *(unset)* | Secret key |
 | `SPACES_PREFIX` | `recordings` | Key prefix inside the bucket |
 | `KEEP_LOCAL_RECORDINGS` | `false` | Keep local `.flv`/`.mp4` after a successful upload |
+| `RESUME_TIMEOUT` | `600` | Seconds a recording waits for a dropped publisher before finalizing without it — see [Reconnects and resumed recordings](#reconnects-and-resumed-recordings) |
+| `CLEANUP_INTERVAL` | `3600` | Seconds between sweeps of the recordings volume |
+| `RECORDING_RETENTION_DAYS` | `7` | How old a leftover file must be before a sweep will consider it |
 | `WEBHOOK_URL` | *(unset)* | Backend endpoint POSTed recording outcomes and camera recording status — see [Status webhook](#status-webhook) |
 | `WEBHOOK_TOKEN` | *(unset)* | Sent as `Authorization: Bearer <token>` on webhook calls |
 | `TLS_MODE` | `proxy` | `proxy` (external TLS termination), `manual` (bring your own cert), or `letsencrypt` (container manages its own via certbot) — see [TLS / HTTPS](#tls--https) |
@@ -432,12 +508,19 @@ docker/
     site-locations.conf.template  shared locations: HLS/DASH, /control, /admin, /auth/publish, player
     http-site.conf.template       :80 vhost - ACME challenge + the shared locations
     https-site.conf.template      :443 vhost (TLS_MODE=manual/letsencrypt only) - same shared locations
-    rtmp-site.conf.template       RTMP ingest app: hls/dash output, recorder
+    rtmp-site.conf.template       RTMP ingest app: hls/dash output, recorder, resume-on-reconnect hook
   docker-entrypoint.sh       renders templates, seeds the key store, starts fcgiwrap, handles TLS_MODE, execs nginx
   mint-key.sh / revoke-key.sh   key management (docker exec)
   admin-api.cgi               key management (HTTP API, POST/DELETE /admin/keys)
-  record-start.cgi            captures ?filename=... on record/start
-  record-done.sh              ffmpeg remux + object storage upload + status webhook, on recording stop
+  record-start.cgi            opens a recording session, captures ?filename=... on record/start
+  record-stop.cgi             closes the session on record/stop (and finalizes it if the camera is offline)
+  record-resume.sh            exec_publish hook: resumes a session's recording when its publisher reconnects
+  record-done.sh              exec_record_done hook: banks each part, finalizes once the session is over
+  record-finalize.sh          finalize a session by hand (docker exec)
+  session-watchdog.sh         finalizes sessions whose publisher never came back (RESUME_TIMEOUT)
+  cleanup-recordings.sh       sweeps leftovers off the recordings volume (hourly, and on demand)
+  rec-session.sh              sourced: the session state machine on /data/rec-sessions
+  rec-finalize.sh             sourced: join parts -> mp4, upload, status webhook
 
 html/
   player.html                 minimal HLS test player + recording controls
@@ -448,7 +531,19 @@ html/
 
 - **Nothing recorded** — recording is manual; you must call
   `/control/record/start` (or click the button) after publishing
-  starts. Check `docker compose logs` for `[record-done]` lines.
+  starts. Everything the recording pipeline does is logged; follow it
+  with `docker compose logs -f | grep session`.
+- **A recording came out far shorter than the booking** — the publisher
+  dropped. Look for `publisher went away` / `publisher reconnected` in
+  the logs: paired up, the recording continued into another part and the
+  final `.mp4` covers the whole booking. A `publisher went away` with no
+  matching reconnect, followed by `publisher gone for …s`, means the
+  camera never came back and the session was finalized at
+  `RESUME_TIMEOUT`. All four streams of one venue dropping in the same
+  second points at that site's uplink, not at this server.
+- **A session is stuck open** — `docker exec <container> ls
+  /data/rec-sessions` lists them; `record-finalize.sh <playback_id>`
+  joins and uploads what it has and closes it.
 - **`/stat` shows no active stream** — make sure `worker_processes 1`
   hasn't been changed; with more than one worker, a stream published to
   one worker is invisible to requests served by another.
@@ -459,6 +554,13 @@ html/
 - **Recordings not uploading** — check `docker compose logs` for
   `SPACES_*` warnings at startup; a bad endpoint/credential doesn't
   crash the container, it just falls back to local-only recording.
+  Note that changing `SPACES_*` in `.env` needs `docker compose up -d`
+  (which recreates the container and re-runs the entrypoint), not
+  `docker compose restart` — a restart reuses the old environment.
+- **Recordings volume filling up** — `cleanup-recordings.sh --dry-run`
+  shows what the hourly sweep considers disposable and what it's
+  holding on to. Files it reports as never uploaded are kept until you
+  run it with `--force`; see [Disk housekeeping](#disk-housekeeping).
 - **`TLS_MODE=letsencrypt` certificate not issued** — check `docker
   compose logs` for `certbot failed`; a bad/unreachable-from-internet
   `DOMAIN` doesn't crash the container, it just stays on HTTP only and

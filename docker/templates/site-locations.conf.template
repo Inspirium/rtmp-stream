@@ -63,10 +63,13 @@ location = /stat.xsl {
 # nginx-rtmp's control module has no concept of a caller-supplied
 # filename, so this exact-match location takes priority over the
 # generic /control below and routes just the start call through
-# record-start.cgi, which stashes ?filename=... (if given) keyed by
-# playback_id, then forwards the real start to the loopback-only
-# /internal/control/record/start. record-done.sh picks the stashed
-# name back up when the recording finishes (see rtmp-site template).
+# record-start.cgi. That opens a recording session for this
+# playback_id - stashing ?filename=... (if given) - and forwards the
+# real start to the loopback-only /internal/control/record/start. The
+# session is what survives a dropped publisher: it stays open across
+# reconnects until /control/record/stop closes it, and the name
+# stashed here is what the joined-up .mp4 ends up called (see
+# rec-session.sh).
 #   GET /control/record/start?app=stream&name=<playback_id>&rec=rec1[&filename=<name>]
 location = /control/record/start {
     auth_basic           "stream control";
@@ -81,19 +84,46 @@ location = /control/record/start {
     fastcgi_pass unix:/run/fcgiwrap.sock;
 }
 
-# real record/start trigger, reachable only from record-start.cgi
+# --- stop recording, closing the session --------------------------
+# Can't be plain rtmp_control either: the stop has to close this
+# playback_id's recording session (see rec-session.sh) BEFORE the
+# recorder shuts down, or record-done.sh mistakes the deliberate stop
+# for a dropped publisher and sits waiting for a reconnect. It also
+# has to answer for a booking whose camera is offline right now, where
+# nginx-rtmp has no recorder to stop but the parts banked before the
+# camera dropped still have to be joined up and uploaded.
+#   GET /control/record/stop?app=stream&name=<playback_id>&rec=rec1
+location = /control/record/stop {
+    auth_basic           "stream control";
+    auth_basic_user_file /usr/local/nginx/conf/control.htpasswd;
+
+    include fastcgi_params;
+    fastcgi_param SCRIPT_FILENAME /usr/local/bin/record-stop.cgi;
+    fastcgi_param RTMP_APP  $arg_app;
+    fastcgi_param RTMP_NAME $arg_name;
+    fastcgi_param RTMP_REC  $arg_rec;
+    fastcgi_pass unix:/run/fcgiwrap.sock;
+}
+
+# real record/start and record/stop triggers, reachable only from
+# record-start.cgi / record-stop.cgi / record-resume.sh
 location = /internal/control/record/start {
     allow 127.0.0.1;
     deny all;
     rtmp_control all;
 }
 
+location = /internal/control/record/stop {
+    allow 127.0.0.1;
+    deny all;
+    rtmp_control all;
+}
+
 # --- rtmp-module control API ---------------------------------------
-# stop recording, drop publishers, etc. (start is handled above).
-# Used by the Start/Stop Recording buttons on the player page. Always
-# behind basic auth in this image — see docker-entrypoint.sh for how
-# the password is set.
-#   GET /control/record/stop?app=stream&name=<playback_id>&rec=rec1
+# drop publishers, redirect, etc. Recording start/stop are handled by
+# the two exact-match locations above, which take priority over this
+# prefix match. Always behind basic auth in this image — see
+# docker-entrypoint.sh for how the password is set.
 location /control {
     rtmp_control all;
     auth_basic           "stream control";

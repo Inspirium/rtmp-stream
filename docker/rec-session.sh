@@ -1,0 +1,181 @@
+#!/bin/sh
+# Shared helpers for the recording-session state machine. Sourced (never
+# executed) by record-start.cgi, record-stop.cgi, record-resume.sh,
+# record-done.sh, record-finalize.sh, session-watchdog.sh and
+# cleanup-recordings.sh.
+#
+# A *session* is one booking's worth of recording: everything between a
+# /control/record/start and its matching /control/record/stop, even if the
+# publisher drops and reconnects several times in between.
+#
+# nginx-rtmp can't reopen a recording it has already closed - a dropped
+# publisher ends the .flv for good - so each publish produces its own
+# "part". The parts are concatenated into a single .mp4 when the session
+# actually stops, so the backend still sees exactly one file under the key
+# it was handed up front: one Video row, one `ready` webhook, no change on
+# that side. Before this existed a 2-second uplink blip silently ended the
+# recording and the rest of the booking was lost (see README's
+# "Reconnects and resumed recordings").
+#
+# State lives on /data - the persistent volume - not /tmp, so a
+# `docker compose up -d` mid-booking doesn't lose it either: the publisher
+# reconnects, exec_publish fires record-resume.sh, and recording carries
+# on into a new part.
+#
+# Everything here is written by two different users - root (fcgiwrap, for
+# the CGIs, plus the watchdog) and the nginx worker's unprivileged user
+# (record-done.sh / record-resume.sh, spawned by nginx-rtmp's exec_*
+# directives) - hence the permissive modes below. Same reasoning as
+# /tmp/rec-pending in docker-entrypoint.sh.
+
+SESSIONS_DIR=/data/rec-sessions
+REC_CONFIG=/data/.rec-config
+REC_LOG=/tmp/record-done.log
+WEBHOOK_ENV_FILE=/data/.webhook-env
+S3_ENV_FILE=/data/.s3-env
+
+# nginx-rtmp doesn't forward an exec'd child's stdout/stderr anywhere, and
+# the worker user can't open PID 1's fds to write there itself - so
+# everything logs to this plain file, which docker-entrypoint.sh tails into
+# the container's real stdout. See the note at the top of record-done.sh.
+rec_log() {
+    printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >>"$REC_LOG" 2>/dev/null || true
+}
+
+# --- session state ------------------------------------------------------
+# One directory per playback_id, one file per field - no parsing, and each
+# field can be updated independently by whichever user gets there first:
+#
+#   name       output basename, no extension (from ?filename=... at start)
+#   state      active | stopping
+#   recording  1 while a recorder is open, 0 between parts
+#   parts      newline-separated absolute .flv paths, in playback order
+#   updated    epoch seconds of the last change (session-watchdog.sh's clock)
+
+# Path of a playback_id's flock file, created if it isn't there yet.
+#
+# It has to be openable for writing by BOTH users involved: root, for the
+# CGIs and the watchdog, and the nginx worker's unprivileged user, for the
+# scripts nginx-rtmp spawns. Whoever gets there first creates it, so the
+# creating umask decides - and root's default 022 would hand the worker a
+# read-only file and deadlock the whole session on it. Force 666 by
+# creating it in a subshell with umask 000 rather than chmod-ing after the
+# fact, which only works when you already own the file.
+lock_path() {
+    _l="/tmp/rec-pending/$1.lock"
+    if [ ! -e "$_l" ]; then
+        ( umask 000; mkdir -p /tmp/rec-pending && : >"$_l" ) 2>/dev/null || true
+    fi
+    printf '%s' "$_l"
+}
+
+session_dir() { printf '%s/%s' "$SESSIONS_DIR" "$1"; }
+
+session_exists() { [ -d "$(session_dir "$1")" ]; }
+
+session_get() {
+    _d=$(session_dir "$1")
+    [ -f "$_d/$2" ] || return 0
+    cat "$_d/$2" 2>/dev/null || true
+}
+
+session_set() {
+    _d=$(session_dir "$1")
+    mkdir -p "$_d" 2>/dev/null || true
+    printf '%s' "$3" >"$_d/$2" 2>/dev/null || true
+    chmod 666 "$_d/$2" 2>/dev/null || true
+    # every write bumps the clock the watchdog reads, so a session that
+    # goes quiet is always visible as "nothing happened since $updated"
+    if [ "$2" != updated ]; then
+        printf '%s' "$(date +%s)" >"$_d/updated" 2>/dev/null || true
+        chmod 666 "$_d/updated" 2>/dev/null || true
+    fi
+}
+
+session_create() {
+    _d=$(session_dir "$1")
+    mkdir -p "$_d" 2>/dev/null || true
+    chmod 777 "$_d" 2>/dev/null || true
+    : >"$_d/parts" 2>/dev/null || true
+    chmod 666 "$_d/parts" 2>/dev/null || true
+    session_set "$1" name "$2"
+    session_set "$1" state active
+    session_set "$1" recording 0
+}
+
+session_destroy() { rm -rf "$(session_dir "$1")" 2>/dev/null || true; }
+
+session_add_part() {
+    _d=$(session_dir "$1")
+    mkdir -p "$_d" 2>/dev/null || true
+    printf '%s\n' "$2" >>"$_d/parts" 2>/dev/null || true
+    chmod 666 "$_d/parts" 2>/dev/null || true
+    session_set "$1" updated "$(date +%s)"
+}
+
+session_parts() {
+    _d=$(session_dir "$1")
+    [ -f "$_d/parts" ] || return 0
+    cat "$_d/parts" 2>/dev/null || true
+}
+
+session_ids() {
+    [ -d "$SESSIONS_DIR" ] || return 0
+    for _p in "$SESSIONS_DIR"/*; do
+        [ -d "$_p" ] || continue
+        basename "$_p"
+    done
+}
+
+# --- config -------------------------------------------------------------
+# docker-entrypoint.sh resolves DOMAIN/UPLOAD_ENABLED/SPACES_* once at
+# startup and writes them here, so the exec'd scripts (which get no env at
+# all beyond TZ) don't need them threaded through as positional arguments.
+
+load_rec_config() {
+    [ -f "$REC_CONFIG" ] || return 0
+    # shellcheck disable=SC1090
+    . "$REC_CONFIG"
+}
+
+load_s3_env() {
+    [ -f "$S3_ENV_FILE" ] || return 1
+    # shellcheck disable=SC1090
+    . "$S3_ENV_FILE"
+    export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+    return 0
+}
+
+# --- webhooks -----------------------------------------------------------
+# POSTs a JSON body to WEBHOOK_URL as this server (Bearer WEBHOOK_TOKEN).
+# No-op when no webhook is configured. Never fails the caller: a backend
+# being down must not cost us the recording.
+
+webhook_post() {
+    [ -f "$WEBHOOK_ENV_FILE" ] || return 0
+    # shellcheck disable=SC1090
+    . "$WEBHOOK_ENV_FILE"
+    [ -n "${WEBHOOK_URL:-}" ] || return 0
+
+    if curl -sf -m 10 -X POST "$WEBHOOK_URL" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer ${WEBHOOK_TOKEN:-}" \
+        -d "$1" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+# {"playback_id","recording":true|false} - "is this camera recording right
+# now", as shown in the backend's camera list. Deliberately NOT sent when a
+# publisher drops mid-session: the booking is still recording as far as
+# anyone is concerned, record-resume.sh will pick it straight back up, and
+# flapping this false/true on every uplink blip would only make the admin
+# UI lie in a noisier way.
+send_camera_status() {
+    if webhook_post "$(printf '{"playback_id":"%s","recording":%s}' "$1" "$2")"; then
+        rec_log "camera webhook notified: recording=$2 playback_id=$1"
+    else
+        rec_log "camera webhook FAILED: recording=$2 playback_id=$1"
+    fi
+}

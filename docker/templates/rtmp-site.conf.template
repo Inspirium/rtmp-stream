@@ -35,6 +35,14 @@ server {
         on_publish http://127.0.0.1/auth/publish;
         notify_method get;
 
+        # Fires on every publish - the first connect of a stream and, just
+        # as importantly, every reconnect after the encoder dropped. If a
+        # recording session is still open for this playback_id,
+        # record-resume.sh starts recording again immediately, so a booking
+        # survives a flaky uplink instead of ending at the first blip. Does
+        # nothing for a stream nobody asked to record. See rec-session.sh.
+        exec_publish /usr/local/bin/record-resume.sh $name;
+
         # written flat (no per-app subdir) so they map 1:1 onto the
         # /hls and /dash http locations, e.g. /hls/<playback_id>.m3u8
         hls on;
@@ -52,17 +60,28 @@ server {
         # Recording is manual only (started/stopped via /control, see
         # above) — nothing is recorded just by publishing. nginx-rtmp
         # writes the raw copy as flv; exec_record_done hands it to
-        # record-done.sh, which uses ffmpeg to remux it into a seekable
-        # .mp4 (named from ?filename=... if the start call set one, see
-        # record-start.cgi / http-site.conf.template) and uploads it to
-        # object storage if SPACES_* was set up (see docker-entrypoint.sh).
+        # record-done.sh.
+        #
+        # One /control/record/start .. /control/record/stop pair is one
+        # *session*, but not necessarily one file: nginx-rtmp closes the
+        # .flv whenever the publisher goes away and can't reopen it, so a
+        # session that outlives a reconnect ends up as several parts.
+        # record-done.sh banks them and ffmpeg joins them into a single
+        # seekable .mp4 at stop time - named from ?filename=... if the
+        # start call set one - which is then uploaded to object storage if
+        # SPACES_* was set up. See rec-session.sh for the state machine
+        # and docker-entrypoint.sh for the storage side.
+        #
+        # Everything record-done.sh needs beyond these two arguments
+        # (domain, bucket, prefix, upload/keep flags) it reads from
+        # /data/.rec-config, which docker-entrypoint.sh writes at startup.
         recorder rec1 {
             record all manual;
             record_suffix -%Y-%m-%d-%H-%M-%S.flv;
             record_path /tmp/rec;
             record_unique on;
 
-            exec_record_done /usr/local/bin/record-done.sh $path $name ${DOMAIN} ${UPLOAD_ENABLED} ${SPACES_BUCKET} ${SPACES_PREFIX} ${KEEP_LOCAL_RECORDINGS};
+            exec_record_done /usr/local/bin/record-done.sh $path $name;
         }
     }
 }
