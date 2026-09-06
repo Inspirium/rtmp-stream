@@ -67,7 +67,7 @@ gave one, otherwise a timestamped default. Files land in <code>/tmp/rec</code>
     if (hls) { hls.destroy(); hls = null; }
 
     if (Hls.isSupported()) {
-      hls = new Hls();
+      hls = new Hls({ liveSyncDurationCount: 2 });
       hls.loadSource(src);
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED, function () { video.play(); });

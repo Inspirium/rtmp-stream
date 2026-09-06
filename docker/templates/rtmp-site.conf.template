@@ -47,8 +47,28 @@ server {
         # /hls and /dash http locations, e.g. /hls/<playback_id>.m3u8
         hls on;
         hls_path /tmp/hls;
-        hls_fragment 3s;
-        hls_playlist_length 60s;
+        # Fragments only close on a keyframe (wait_key on), so hls_fragment
+        # is a FLOOR, not a target: the real fragment length is the first
+        # keyframe at or after 1s. Encoders must publish a 1s keyframe
+        # interval (Dahua: I Frame Interval = frame rate) or fragments -
+        # and latency - grow to the encoder's GOP regardless of what's set
+        # here. A camera pushing a long-GOP profile was producing 25s
+        # fragments against the old 3s setting.
+        #
+        # Players target ~3x EXT-X-TARGETDURATION, and nginx-rtmp writes
+        # that as the MAX fragment duration in the window (floored at
+        # hls_fragment), so one long fragment raises latency for the whole
+        # window until it ages out.
+        #
+        # These two must move together: the window is a fragment COUNT,
+        # winfrags = hls_playlist_length / hls_fragment, fixed at config
+        # parse. hls_cleanup keeps winfrags*2+1 fragments on disk, and
+        # /tmp/hls is neither a volume nor swept by cleanup-recordings.sh.
+        # Shortening hls_fragment alone multiplies both the manifest and
+        # the on-disk retention - 60s/3s kept 41 fragments, 60s/1s would
+        # keep 121. 20s/1s holds it at the same 20-fragment window.
+        hls_fragment 1s;
+        hls_playlist_length 20s;
         hls_cleanup on;
 
         dash on;
