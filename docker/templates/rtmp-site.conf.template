@@ -48,12 +48,19 @@ server {
         hls on;
         hls_path /tmp/hls;
         # Fragments only close on a keyframe (wait_key on), so hls_fragment
-        # is a FLOOR, not a target: the real fragment length is the first
-        # keyframe at or after 1s. Encoders must publish a 1s keyframe
-        # interval (Dahua: I Frame Interval = frame rate) or fragments -
-        # and latency - grow to the encoder's GOP regardless of what's set
+        # is a FLOOR, not a target: a fragment closes at the first keyframe
+        # once elapsed >= hls_fragment, so the real fragment length is the
+        # encoder's GOP, and latency grows with it regardless of what's set
         # here. A camera pushing a long-GOP profile was producing 25s
         # fragments against the old 3s setting.
+        #
+        # Keep this strictly BELOW the encoder's keyframe interval. Setting
+        # it equal is the trap: at hls_fragment 1s against a nominal 1s GOP,
+        # a keyframe arriving at 0.999s fails the >= test, gets skipped, and
+        # the fragment doubles to ~2s - which pins EXT-X-TARGETDURATION (a
+        # max over the window) at 2 and doubles latency for every viewer.
+        # At 500ms every keyframe closes its own fragment, so a 1s GOP
+        # yields a clean 1s fragment with margin for encoder drift.
         #
         # Players target ~3x EXT-X-TARGETDURATION, and nginx-rtmp writes
         # that as the MAX fragment duration in the window (floored at
@@ -65,10 +72,11 @@ server {
         # parse. hls_cleanup keeps winfrags*2+1 fragments on disk, and
         # /tmp/hls is neither a volume nor swept by cleanup-recordings.sh.
         # Shortening hls_fragment alone multiplies both the manifest and
-        # the on-disk retention - 60s/3s kept 41 fragments, 60s/1s would
-        # keep 121. 20s/1s holds it at the same 20-fragment window.
-        hls_fragment 1s;
-        hls_playlist_length 20s;
+        # the on-disk retention - 60s/3s kept 41 fragments, 60s/500ms would
+        # keep 241. 10s/500ms holds winfrags at 20, the same window as
+        # before, which with ~1s real fragments is ~20s of playlist.
+        hls_fragment 500ms;
+        hls_playlist_length 10s;
         hls_cleanup on;
 
         dash on;
