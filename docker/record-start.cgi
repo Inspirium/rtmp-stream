@@ -70,6 +70,10 @@ case "$STATUS" in
     200)
         session_set "$NAME" recording 1
         rec_log "session ${NAME}: recording started${FILENAME:+ as ${FILENAME}.mp4}"
+        # something is publishing right now, so this is the earliest point
+        # the codec can be read. The 202 branch below deliberately doesn't
+        # try: nothing is publishing yet, so there'd be nothing to read.
+        session_capture_codec "$NAME"
         send_camera_status "$NAME" true
         respond "$STATUS"
         ;;

@@ -30,6 +30,14 @@ while true; do
 
     for ID in $(session_ids); do
         [ "$(session_get "$ID" state)" = active ] || continue
+
+        # Opportunistic, and deliberately above the recording check below:
+        # a session that IS recording is exactly the one whose publisher is
+        # live and readable. A booking that started before its camera
+        # connected has no codec recorded yet, and this is what fills it in
+        # once the camera turns up. No-ops once we have a value.
+        session_capture_codec "$ID" || true
+
         # a recorder is open - the camera is here, nothing to do
         [ "$(session_get "$ID" recording)" != 1 ] || continue
 

@@ -51,6 +51,8 @@ rec_log() {
 #   recording  1 while a recorder is open, 0 between parts
 #   parts      newline-separated absolute .flv paths, in playback order
 #   updated    epoch seconds of the last change (session-watchdog.sh's clock)
+#   video_codec  what /stat says the publisher is sending, e.g. h264 -
+#              captured opportunistically, absent when we never saw it
 
 # Path of a playback_id's flock file, created if it isn't there yet.
 #
@@ -146,6 +148,60 @@ load_s3_env() {
     # shellcheck disable=SC1090
     . "$S3_ENV_FILE"
     export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+    return 0
+}
+
+# --- publisher metadata -------------------------------------------------
+# The video codec the encoder is actually publishing, read from /stat.
+#
+# Worth capturing because a stream nothing can play still looks healthy
+# from every other angle: H.265 publishes fine, passes auth, reports sane
+# bandwidth and resolution, and produces a recording with no video in it
+# (see the probe in rec-finalize.sh). Knowing the codec turns "this
+# recording is empty" into "this recording is empty because the camera is
+# on H.265" - the difference between a mystery and a setting somebody can
+# go and change.
+#
+# Only knowable while the stream is live, and only once the encoder has
+# sent enough for nginx-rtmp to parse a codec header. So it's captured
+# opportunistically - at record start, by the watchdog, and once more at
+# finalize time - and simply stays empty when we never got a look.
+
+# usage: stat_video_codec <playback_id>; echoes e.g. "h264", or nothing
+stat_video_codec() {
+    curl -s -m 5 http://127.0.0.1/stat 2>/dev/null | tr -d '\n' | awk -v id="$1" '
+        {
+            n = split($0, blocks, "</stream>")
+            for (i = 1; i <= n; i++) {
+                b = blocks[i]
+                if (index(b, "<name>" id "</name>") == 0) continue
+                p = index(b, "<meta><video>")
+                if (p == 0) continue
+                rest = substr(b, p)
+                c = index(rest, "<codec>")
+                if (c == 0) continue
+                rest = substr(rest, c + 7)
+                e = index(rest, "</codec>")
+                if (e == 0) continue
+                print tolower(substr(rest, 1, e - 1))
+                exit
+            }
+        }' 2>/dev/null || true
+}
+
+# Store the codec on the session if we don't have it yet. Cheap to call
+# repeatedly: does nothing once a value is recorded, and nothing while the
+# stream isn't publishing.
+session_capture_codec() {
+    [ -n "${1:-}" ] || return 0
+    if [ -n "$(session_get "$1" video_codec)" ]; then
+        return 0
+    fi
+    _c=$(stat_video_codec "$1")
+    if [ -n "$_c" ]; then
+        session_set "$1" video_codec "$_c"
+        rec_log "session $1: publisher video codec is ${_c}"
+    fi
     return 0
 }
 

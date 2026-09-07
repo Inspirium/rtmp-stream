@@ -18,6 +18,13 @@ finalize_session() {
     _name=$(session_get "$_id" name)
     _rec_dir=${REC_DIR:-/tmp/rec}
 
+    # Last chance to learn the codec. On an explicit /control/record/stop
+    # the camera is usually still publishing, so /stat still has it; on a
+    # watchdog timeout the publisher is long gone and this does nothing,
+    # leaving whatever record-start or the watchdog managed to catch.
+    session_capture_codec "$_id"
+    _codec=$(session_get "$_id" video_codec)
+
     # the camera really has stopped recording by the time we get here,
     # whatever happens to the file below - tell the backend first, before
     # any of the parts that can fail
@@ -93,7 +100,7 @@ finalize_session() {
     if [ "$_count" -eq 0 ]; then
         rec_log "session ${_id} finished with no usable footage - nothing to upload"
         _key_name=${_name:-$_id}
-        send_video_status "${_key_name}.mp4" failed ""
+        send_video_status "${_key_name}.mp4" failed "" "" no_footage "$_codec"
         session_destroy "$_id"
         return 0
     fi
@@ -128,7 +135,7 @@ finalize_session() {
         if ! ffmpeg -y -loglevel error -i "$_first" \
                 -c copy -movflags +faststart "$_mp4"; then
             rec_log "ffmpeg remux FAILED for ${_base} - keeping ${_first}"
-            send_video_status "$_base" failed ""
+            send_video_status "$_base" failed "" "" remux_failed "$_codec"
             session_destroy "$_id"
             return 1
         fi
@@ -142,7 +149,7 @@ finalize_session() {
         if ! ffmpeg -y -loglevel error -f concat -safe 0 -i "$_list" \
                 -c copy -movflags +faststart "$_mp4"; then
             rec_log "ffmpeg concat FAILED for ${_base} - keeping parts in ${_rec_dir}"
-            send_video_status "$_base" failed ""
+            send_video_status "$_base" failed "" "" concat_failed "$_codec"
             session_destroy "$_id"
             return 1
         fi
@@ -164,7 +171,7 @@ finalize_session() {
     if ! ffprobe -v error -select_streams v:0 -show_entries stream=codec_type \
             -of csv=p=0 "$_mp4" 2>/dev/null | grep -q video; then
         rec_log "no video stream in ${_base} - encoder is probably publishing H.265 or sending no keyframes; keeping ${_mp4}"
-        send_video_status "$_base" failed ""
+        send_video_status "$_base" failed "" "" no_video_track "$_codec"
         session_destroy "$_id"
         return 1
     fi
@@ -177,7 +184,7 @@ finalize_session() {
 
     if ! load_s3_env; then
         rec_log "${S3_ENV_FILE} missing, cannot upload ${_base}"
-        send_video_status "$_base" failed ""
+        send_video_status "$_base" failed "" "" storage_unconfigured "$_codec"
         session_destroy "$_id"
         return 1
     fi
@@ -186,7 +193,7 @@ finalize_session() {
     if s5cmd --endpoint-url "$S3_ENDPOINT_URL" --log error cp "$_mp4" "$_dest" >/dev/null 2>&1; then
         _size=$(wc -c <"$_mp4" | tr -d ' ')
         rec_log "uploaded ${_base} to ${_dest} (${_count} part(s), ${_size} bytes)"
-        send_video_status "$_base" ready "$_size" "$(gaps_json "$_id" "$_meta")"
+        send_video_status "$_base" ready "$_size" "$(gaps_json "$_id" "$_meta")" "" "$_codec"
         if [ "${KEEP_LOCAL_RECORDINGS:-false}" != true ]; then
             rm -f "$_mp4"
             for _p in $(session_parts "$_id"); do rm -f "$_p"; done
@@ -196,7 +203,7 @@ finalize_session() {
     fi
 
     rec_log "upload FAILED for ${_base}, keeping local copies in ${_rec_dir}"
-    send_video_status "$_base" failed ""
+    send_video_status "$_base" failed "" "" upload_failed "$_codec"
     session_destroy "$_id"
     return 1
 }
@@ -257,11 +264,22 @@ send_video_status() {
     if [ -n "$3" ]; then
         # `gaps` is always present on a "ready", as [] for the usual
         # unbroken recording, so a backend can parse one shape either way
-        _payload=$(printf '{"key":"%s","status":"%s","size":%s,"gaps":%s}' \
+        _payload=$(printf '{"key":"%s","status":"%s","size":%s,"gaps":%s' \
             "$_k" "$2" "$3" "${4:-[]}")
     else
-        _payload=$(printf '{"key":"%s","status":"%s"}' "$_k" "$2")
+        _payload=$(printf '{"key":"%s","status":"%s"' "$_k" "$2")
     fi
+    # Both optional, and both omitted when we don't have them rather than
+    # sent empty - the backend validates them as sometimes-present, so a
+    # payload without either stays valid and neither side's deploy has to
+    # go first. `reason` is a stable slug to switch on, never prose.
+    if [ -n "${5:-}" ]; then
+        _payload="${_payload}$(printf ',"reason":"%s"' "$5")"
+    fi
+    if [ -n "${6:-}" ]; then
+        _payload="${_payload}$(printf ',"video_codec":"%s"' "$6")"
+    fi
+    _payload="${_payload}}"
     if webhook_post "$_payload"; then
         rec_log "webhook notified: $2 ${_k}"
     else

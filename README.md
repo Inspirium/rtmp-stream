@@ -312,8 +312,41 @@ joining and (if object storage is configured) uploading:
 }
 ```
 
-or, if ffmpeg failed or the upload didn't make it, `"status": "failed"`
-with no `size` and no `gaps`. `key` is exactly what the file lands at in the Space —
+or, if something went wrong, `"status": "failed"` with no `size` and no
+`gaps`:
+
+```json
+{
+  "key": "<prefix>/<domain>/<filename>.mp4",
+  "status": "failed",
+  "reason": "no_video_track",
+  "video_codec": "hevc"
+}
+```
+
+`reason` is a short stable slug, never prose, and is one of:
+
+| `reason` | what happened |
+| --- | --- |
+| `no_footage` | the session ended without a single usable part |
+| `no_video_track` | the finished file has no video stream at all — the encoder was publishing a codec nothing here can read (H.265), or never sent a keyframe |
+| `remux_failed` | ffmpeg could not remux the single part |
+| `concat_failed` | ffmpeg could not join a multi-part session |
+| `storage_unconfigured` | object storage credentials were missing at upload time |
+| `upload_failed` | the upload to object storage did not complete |
+
+`video_codec` is whatever `/stat` reported the publisher was sending,
+lowercased and unmodified (`h264`, `hevc`, ...). It is sent on `ready`
+too, so a backend can notice a camera on the wrong codec before a
+recording fails.
+
+Both fields are **optional**. The codec can only be read while the stream
+is live and after the encoder has sent enough for nginx-rtmp to parse a
+codec header, so a short booking whose camera never overlapped a read
+simply omits it — treat a missing `reason` as "cause unknown" rather than
+inferring anything from its absence.
+
+`key` is exactly what the file lands at in the Space —
 `<prefix>/<domain>/<filename>.mp4`, the same value a backend already
 knows upfront if it set the recording's filename via `?filename=...`
 (see [Recording](#recording)). Nothing is sent for recordings kept
