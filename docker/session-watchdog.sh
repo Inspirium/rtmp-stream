@@ -22,11 +22,16 @@ load_rec_config
 TIMEOUT=${RESUME_TIMEOUT:-600}
 INTERVAL=30
 
-rec_log "session watchdog started (finalizing sessions idle for more than ${TIMEOUT}s)"
+rec_log "session watchdog started (finalizing sessions idle for more than ${TIMEOUT}s, publisher state polled every ${INTERVAL}s)"
 
 while true; do
     sleep "$INTERVAL"
     NOW=$(date +%s)
+
+    # "is this camera sending video right now", reported when it changes.
+    # Lives here because this is the only loop that already runs on a tick
+    # short enough for the answer to still be true when it arrives.
+    report_publisher_states || true
 
     for ID in $(session_ids); do
         [ "$(session_get "$ID" state)" = active ] || continue

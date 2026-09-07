@@ -353,16 +353,48 @@ knows upfront if it set the recording's filename via `?filename=...`
 local-only (no object storage configured) — those never reach a "ready"
 state a remote backend could act on.
 
-**Camera recording status** (`record-start.cgi` / `rec-finalize.sh`) —
-whether a given camera (`playback_id`) is currently recording, sent
-`true` the moment `/control/record/start` is accepted and `false` when
-the recording session ends: an explicit `/control/record/stop`, the
-publisher staying away past `RESUME_TIMEOUT`, or an error partway
-through joining/uploading.
+**Camera recording status** (`record-start.cgi` / `rec-finalize.sh` /
+`session-watchdog.sh`) — whether a given camera (`playback_id`) is
+currently recording, sent `true` the moment `/control/record/start` is
+accepted and `false` when the recording session ends: an explicit
+`/control/record/stop`, the publisher staying away past
+`RESUME_TIMEOUT`, or an error partway through joining/uploading.
 
 ```json
-{ "playback_id": "<playback_id>", "recording": true }
+{
+  "playback_id": "<playback_id>",
+  "recording": true,
+  "bw_video": 4265312,
+  "video_codec": "h264"
+}
 ```
+
+`bw_video` is the publisher's current video bitrate as `/stat` reports
+it, and `video_codec` what it says the camera is sending. Together they
+answer "is this camera sending usable video right now", which the
+recording webhooks alone cannot: a camera idle between bookings can go
+hours without a recording transition.
+
+They matter because a camera can be connected, authenticated, announcing
+sane metadata and sending **no video at all** — `bw_video` 0 while
+`bw_in` keeps ticking over on audio. From outside that is
+indistinguishable from a camera sending video nothing can mux (H.265, or
+no keyframes), and the two want completely different advice:
+
+| | meaning |
+| --- | --- |
+| `bw_video` 0 | the camera is sending no video — reboot it, check the encoder |
+| `bw_video` > 0, no HLS playlist | video is arriving that cannot be muxed — check compression (H.265) and keyframe interval |
+
+`bw_video` is sent **explicitly, including when it is `0`** — an omitted
+field means "this server does not report it", which is not the same
+thing and must not be read as "no video".
+
+Besides the recording transitions above, `session-watchdog.sh` polls
+every publisher each tick (30s) and sends this payload **when a camera's
+state changes** — crossing between sending video and not, or changing
+codec. An unchanging fleet sends nothing, so the value is current to
+within one tick rather than as of the last recording transition.
 
 A publisher dropping out mid-recording does **not** send `false` — the
 recording resumes when the encoder reconnects (see [Reconnects and

@@ -283,12 +283,111 @@ webhook_post() {
 # anyone is concerned, record-resume.sh will pick it straight back up, and
 # flapping this false/true on every uplink blip would only make the admin
 # UI lie in a noisier way.
+# usage: send_camera_status <playback_id> <true|false> [bw_video] [codec]
+#
+# bw_video is sent explicitly INCLUDING when it is 0 - "0" and "absent"
+# have to mean different things, or a backend can't tell a camera sending
+# no video from a server too old to say. Only genuinely-unknown omits it.
 send_camera_status() {
-    if webhook_post "$(printf '{"playback_id":"%s","recording":%s}' "$1" "$2")"; then
-        rec_log "camera webhook notified: recording=$2 playback_id=$1"
+    _payload=$(printf '{"playback_id":"%s","recording":%s' "$1" "$2")
+    if [ -n "${3:-}" ]; then
+        _payload="${_payload}$(printf ',"bw_video":%s' "$3")"
+    fi
+    if [ -n "${4:-}" ]; then
+        _payload="${_payload}$(printf ',"video_codec":"%s"' "$4")"
+    fi
+    _payload="${_payload}}"
+
+    if webhook_post "$_payload"; then
+        rec_log "camera webhook notified: recording=$2${3:+ bw_video=$3}${4:+ codec=$4} playback_id=$1"
     else
         rec_log "camera webhook FAILED: recording=$2 playback_id=$1"
     fi
+}
+
+# --- live publisher state ------------------------------------------------
+# "Is this camera sending video right now" - which the recording webhooks
+# alone can't answer, because they only fire on a recording transition and
+# a camera idle between bookings can go hours without one.
+#
+# A camera can be connected, authenticated, announcing sane metadata and
+# sending no video at all: bw_video 0 while bw_in keeps ticking over on
+# audio. That looks identical from outside to a camera sending video
+# nothing can mux (H.265, or no keyframes), and the two want completely
+# different advice. bw_video separates them without opening a file.
+#
+# Reported on CHANGE rather than on a timer: the poll is every watchdog
+# tick, but a webhook only goes out when a camera crosses between sending
+# video and not, or changes codec. An unchanging fleet costs nothing.
+
+# One line per publishing stream: "<playback_id> <bw_video> <codec>"
+stat_publishers() {
+    curl -s -m 5 http://127.0.0.1/stat 2>/dev/null | tr -d '\n' | awk '
+        function field(hay, tag,   a, b, inner) {
+            a = index(hay, "<" tag ">")
+            if (a == 0) return ""
+            inner = substr(hay, a + length(tag) + 2)
+            b = index(inner, "</" tag ">")
+            if (b == 0) return ""
+            return substr(inner, 1, b - 1)
+        }
+        {
+            # split on the OPENING tag: the text before the first <stream>
+            # is the <application><name>stream</name> header, whose <name>
+            # would otherwise be read as a publisher called "stream" and
+            # shadow the first real one. Everything after a <stream> up to
+            # its </stream> is exactly one stream and nothing else.
+            n = split($0, blocks, "<stream>")
+            for (i = 2; i <= n; i++) {
+                b = blocks[i]
+                e = index(b, "</stream>")
+                if (e > 0) b = substr(b, 1, e - 1)
+                if (index(b, "<publishing/>") == 0) continue
+                nm = field(b, "name")
+                if (nm == "") continue
+                bw = field(b, "bw_video")
+                if (bw == "") bw = "0"
+                codec = ""
+                p = index(b, "<meta><video>")
+                if (p > 0) codec = tolower(field(substr(b, p), "codec"))
+                print nm, bw, codec
+            }
+        }' 2>/dev/null || true
+}
+
+# Poll every publisher and report the ones whose state changed since last
+# time. `recording` is derived from the SESSION, not from whether a
+# recorder happens to be open: a publisher that drops mid-booking is still
+# recording as far as anyone is concerned, and flapping it false/true on
+# every blip is exactly what send_camera_status's callers avoid doing.
+report_publisher_states() {
+    _seen=/tmp/rec-pending
+    mkdir -p "$_seen" 2>/dev/null || true
+
+    stat_publishers | while read -r _pid _bw _codec; do
+        [ -n "$_pid" ] || continue
+
+        # zero vs non-zero is the state worth reporting; the exact byte
+        # rate wanders constantly and would fire a webhook every tick
+        if [ "$_bw" = "0" ]; then _live=no; else _live=yes; fi
+
+        if [ "$(session_get "$_pid" state)" = active ]; then
+            _rec=true
+        else
+            _rec=false
+        fi
+
+        _now="${_live} ${_codec} ${_rec}"
+        _f="${_seen}/${_pid}.pubstate"
+        if [ "$(cat "$_f" 2>/dev/null)" = "$_now" ]; then
+            continue
+        fi
+
+        send_camera_status "$_pid" "$_rec" "$_bw" "$_codec"
+        printf '%s' "$_now" >"$_f" 2>/dev/null || true
+        chmod 666 "$_f" 2>/dev/null || true
+    done
+    return 0
 }
 
 # --- gaps ---------------------------------------------------------------
