@@ -14,7 +14,7 @@
 # and reported, exactly as if someone had called /control/record/stop.
 set -eu
 
-exec >>/tmp/record-done.log 2>&1
+exec >>/data/record-done.log 2>&1
 
 . /usr/local/bin/rec-session.sh
 load_rec_config

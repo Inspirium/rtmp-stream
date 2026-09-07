@@ -30,7 +30,16 @@
 
 SESSIONS_DIR=/data/rec-sessions
 REC_CONFIG=/data/.rec-config
-REC_LOG=/tmp/record-done.log
+# On /data - the persistent volume - so a restart doesn't erase the record
+# of why a recording failed. That matters more since the status webhook
+# grew a `reason` slug: the log is the only place the detail behind one
+# lives, and a deploy used to wipe it.
+#
+# NOTE: four scripts (record-done.sh, record-resume.sh, record-finalize.sh,
+# session-watchdog.sh) redirect their whole output here with `exec >>`
+# BEFORE they source this file, so they repeat the path as a literal. If
+# you change it here, change it there too.
+REC_LOG=/data/record-done.log
 WEBHOOK_ENV_FILE=/data/.webhook-env
 S3_ENV_FILE=/data/.s3-env
 
@@ -148,6 +157,49 @@ load_s3_env() {
     # shellcheck disable=SC1090
     . "$S3_ENV_FILE"
     export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+    return 0
+}
+
+# --- log rotation -------------------------------------------------------
+# The log lives on a volume now, so nothing truncates it at startup any
+# more and it has to be kept in check here instead.
+#
+# Copy-and-truncate rather than rename, because four scripts hold this file
+# open for their whole run (`exec >>` above). A rename would leave them
+# writing to the rotated file for as long as they live - which for
+# session-watchdog.sh is the life of the container. Truncating in place
+# keeps their fds valid: they were opened append-only, so the next write
+# lands at the new end of file rather than at a stale offset.
+#
+# The cost of copy-truncate is that anything written between the copy and
+# the truncate is lost. That is one line at worst, and the alternative
+# loses every line the watchdog writes until the next restart.
+
+rotate_rec_log() {
+    _max=${REC_LOG_MAX_BYTES:-5242880}
+    _keep=${REC_LOG_KEEP:-3}
+    case "$_max$_keep" in *[!0-9]*) return 0 ;; esac
+    [ -f "$REC_LOG" ] || return 0
+
+    _sz=$(wc -c <"$REC_LOG" 2>/dev/null | tr -d ' ')
+    case "$_sz" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$_sz" -gt "$_max" ] || return 0
+
+    # shift the existing rotations up; the oldest falls off the end
+    _n=$_keep
+    while [ "$_n" -gt 1 ]; do
+        _prev=$((_n - 1))
+        if [ -f "${REC_LOG}.${_prev}" ]; then
+            mv -f "${REC_LOG}.${_prev}" "${REC_LOG}.${_n}" 2>/dev/null || true
+        fi
+        _n=$_prev
+    done
+
+    if cp "$REC_LOG" "${REC_LOG}.1" 2>/dev/null; then
+        : >"$REC_LOG" 2>/dev/null || true
+        chmod 666 "$REC_LOG" 2>/dev/null || true
+        rec_log "log rotated at ${_sz} bytes (keeping ${_keep})"
+    fi
     return 0
 }
 

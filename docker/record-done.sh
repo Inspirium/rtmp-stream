@@ -23,7 +23,7 @@ set -eu
 # open root's end of that pipe. Instead, append to a plain log file this
 # user CAN write to; docker-entrypoint.sh tails that file in the
 # background straight into the container's real stdout/stderr.
-exec >>/tmp/record-done.log 2>&1
+exec >>/data/record-done.log 2>&1
 
 RAW_PATH=$1
 PLAYBACK_ID=$2

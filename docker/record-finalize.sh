@@ -10,7 +10,7 @@
 #   docker exec <container> record-finalize.sh <playback_id>
 set -eu
 
-exec >>/tmp/record-done.log 2>&1
+exec >>/data/record-done.log 2>&1
 
 PLAYBACK_ID=${1:?usage: record-finalize.sh <playback_id>}
 

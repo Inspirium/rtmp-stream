@@ -347,9 +347,13 @@ fi
 # container at this point, before exec below hands them to nginx) so it
 # ends up in `docker compose logs` same as everything else. Forked here,
 # so it keeps running as its own process after exec replaces this shell.
-: >/tmp/record-done.log
-chmod 666 /tmp/record-done.log
-tail -F -n0 /tmp/record-done.log &
+# Created if absent, never truncated: it's on the /data volume so it
+# outlives the container, and wiping it on every start would throw away
+# the only record of why past recordings failed. rotate_rec_log (see
+# rec-session.sh) is what keeps it from growing without limit.
+touch /data/record-done.log
+chmod 666 /data/record-done.log
+tail -F -n0 /data/record-done.log &
 
 # A booking whose camera never comes back would otherwise keep its session
 # (and its parts) forever, with the backend waiting on a recording that
@@ -361,11 +365,16 @@ session-watchdog.sh &
 # recordings that failed to upload or were killed mid-write. Conservative
 # by default: see cleanup-recordings.sh for what it will and won't remove.
 (
+    . /usr/local/bin/rec-session.sh
     while true; do
         sleep "$CLEANUP_INTERVAL"
-        cleanup-recordings.sh --quiet >>/tmp/record-done.log 2>&1 || true
+        cleanup-recordings.sh --quiet >>"$REC_LOG" 2>&1 || true
+        # same loop, because it's the same job: keeping /data and the
+        # recordings volume from filling up unattended
+        rotate_rec_log || true
     done
 ) &
 echo "[setup] recordings volume swept every ${CLEANUP_INTERVAL}s (retention ${RECORDING_RETENTION_DAYS}d)"
+echo "[setup] record log at /data/record-done.log, rotated past ${REC_LOG_MAX_BYTES:-5242880} bytes (keeping ${REC_LOG_KEEP:-3})"
 
 exec "$@"

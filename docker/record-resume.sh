@@ -18,7 +18,7 @@ set -eu
 
 # same reason as record-done.sh: nginx-rtmp swallows an exec'd child's
 # output, and this runs as the unprivileged worker user
-exec >>/tmp/record-done.log 2>&1
+exec >>/data/record-done.log 2>&1
 
 PLAYBACK_ID=$1
 
