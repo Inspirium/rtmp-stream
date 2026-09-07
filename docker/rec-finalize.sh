@@ -148,6 +148,27 @@ finalize_session() {
         fi
     fi
 
+    # A publish the muxers can't read - H.265 (the HLS/DASH muxers and this
+    # recorder all only understand H.264), or an encoder that never sends a
+    # keyframe - still produces an .flv, because nginx-rtmp writes whatever
+    # arrives. It just has no video in it: the recorder skips every video
+    # frame waiting for a keyframe it never recognises. ffmpeg -c copy then
+    # copies that nothing quite happily and exits 0, so without this check
+    # the success path below reports "ready" for a file with no picture.
+    #
+    # That's the expensive failure: the backend reconciler treats the
+    # booking as fully covered, never reports a gap, and so never asks the
+    # camera for its own SD-card copy - which is intact, and gets
+    # overwritten while nobody goes to fetch it. Report failed instead and
+    # keep the file for diagnosis.
+    if ! ffprobe -v error -select_streams v:0 -show_entries stream=codec_type \
+            -of csv=p=0 "$_mp4" 2>/dev/null | grep -q video; then
+        rec_log "no video stream in ${_base} - encoder is probably publishing H.265 or sending no keyframes; keeping ${_mp4}"
+        send_video_status "$_base" failed ""
+        session_destroy "$_id"
+        return 1
+    fi
+
     if [ "${UPLOAD_ENABLED:-false}" != true ]; then
         rec_log "object storage not configured, keeping ${_mp4} local"
         session_destroy "$_id"
