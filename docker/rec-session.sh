@@ -305,6 +305,35 @@ send_camera_status() {
     fi
 }
 
+# --- forced stop ---------------------------------------------------------
+# Stop a session the way /control/record/stop does, for callers that
+# aren't the CGI - currently just session-watchdog.sh's maximum-duration
+# backstop.
+#
+# The ordering is the subtle part and is not optional: `state` must go to
+# `stopping` BEFORE the recorder closes, because record-done.sh reads it
+# to tell "the booking is over, join the parts up" from "the uplink
+# blinked, hold this part and wait for a reconnect". Get it the wrong way
+# round and the session is left waiting for a camera that is still there.
+#
+# Echoes the control module's status so the caller can do what
+# record-stop.cgi does with it:
+#   200  a recorder was open and is now closed - exec_record_done has
+#        fired, so record-done.sh banks the last part and finalizes, and
+#        the caller must NOT finalize as well
+#   204  nothing was recording - nobody else is coming, so the caller
+#        finalizes whatever was banked earlier
+#
+# record-stop.cgi implements this same sequence inline because it also has
+# to turn the status into an HTTP response. If you change the ordering
+# here, change it there too.
+session_force_stop() {
+    session_set "$1" state stopping
+    curl -s -o /dev/null -w '%{http_code}' \
+        "http://127.0.0.1/internal/control/record/stop?app=${RTMP_APP:-stream}&name=$1&rec=${RTMP_REC:-rec1}" \
+        2>/dev/null || printf '000'
+}
+
 # --- live publisher state ------------------------------------------------
 # "Is this camera sending video right now" - which the recording webhooks
 # alone can't answer, because they only fire on a recording transition and

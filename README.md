@@ -232,6 +232,14 @@ Two cases don't end in a reconnect, and both are handled:
 - **You stop a booking while its camera is offline.** There's no
   recorder for nginx-rtmp to close, so `record/stop` finalizes the
   banked parts itself and returns `200`.
+- **The stop never arrives at all.** `RESUME_TIMEOUT` can't catch this
+  one: the camera is still publishing, so the session looks like a very
+  long booking rather than an abandoned one. After `MAX_SESSION_SECONDS`
+  (default 14400, four hours; `0` disables) the watchdog stops it the
+  same way `record/stop` would — closing the recorder first, so the last
+  part is banked rather than left growing on disk — and finalizes it.
+  Set it well above your longest real booking: tripping it early ends a
+  match that was still being played.
 
 Sessions live on the `/data` volume, so they also survive the container
 being restarted mid-booking: `docker compose up -d` to change a setting

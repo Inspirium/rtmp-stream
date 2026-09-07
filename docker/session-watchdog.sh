@@ -22,7 +22,19 @@ load_rec_config
 TIMEOUT=${RESUME_TIMEOUT:-600}
 INTERVAL=30
 
-rec_log "session watchdog started (finalizing sessions idle for more than ${TIMEOUT}s, publisher state polled every ${INTERVAL}s)"
+# Backstop against a session that is never stopped. RESUME_TIMEOUT below
+# only catches a publisher that went AWAY; a session whose camera keeps
+# publishing and whose stop never arrives is skipped forever by the
+# recording check, because from here it is indistinguishable from a very
+# long booking. One of those ran for sixteen hours in August and wrote a
+# 37 GB .flv before anyone noticed.
+#
+# Deliberately generous: tripping this on a real booking ends it early and
+# the rest of that match is lost, which is worse than the disk. Four hours
+# is roughly four times the longest booking we have seen. Set 0 to disable.
+MAX_SESSION=${MAX_SESSION_SECONDS:-14400}
+
+rec_log "session watchdog started (idle limit ${TIMEOUT}s, max session ${MAX_SESSION}s, publisher state polled every ${INTERVAL}s)"
 
 while true; do
     sleep "$INTERVAL"
@@ -42,6 +54,34 @@ while true; do
         # connected has no codec recorded yet, and this is what fills it in
         # once the camera turns up. No-ops once we have a value.
         session_capture_codec "$ID" || true
+
+        # Maximum duration, checked BEFORE the recording test below - a
+        # runaway session is precisely one that is still recording, so the
+        # skip below would never let us see it.
+        STARTED=$(session_get "$ID" started)
+        case "$STARTED" in ''|*[!0-9]*) STARTED="" ;; esac
+        if [ "$MAX_SESSION" -gt 0 ] && [ -n "$STARTED" ]; then
+            AGE=$((NOW - STARTED))
+            if [ "$AGE" -ge "$MAX_SESSION" ]; then
+                rec_log "session ${ID}: running ${AGE}s (limit ${MAX_SESSION}s) - no stop ever arrived, closing it out"
+                # Has to go through a real stop: the recorder is still open,
+                # so finalizing directly would find no banked parts, report
+                # the booking failed, and leave nginx-rtmp writing the .flv
+                # for as long as the camera stays up. See session_force_stop.
+                ST=$(session_force_stop "$ID")
+                case "$ST" in
+                    200)
+                        # recorder closed - record-done.sh finalizes
+                        rec_log "session ${ID}: recorder closed, finalizing via record-done"
+                        ;;
+                    *)
+                        rec_log "session ${ID}: nothing was recording (control status ${ST}) - finalizing banked parts here"
+                        record-finalize.sh "$ID" || true
+                        ;;
+                esac
+                continue
+            fi
+        fi
 
         # a recorder is open - the camera is here, nothing to do
         [ "$(session_get "$ID" recording)" != 1 ] || continue
