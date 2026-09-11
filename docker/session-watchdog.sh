@@ -34,11 +34,89 @@ INTERVAL=30
 # is roughly four times the longest booking we have seen. Set 0 to disable.
 MAX_SESSION=${MAX_SESSION_SECONDS:-14400}
 
-rec_log "session watchdog started (idle limit ${TIMEOUT}s, max session ${MAX_SESSION}s, publisher state polled every ${INTERVAL}s)"
+# --- nginx liveness ------------------------------------------------------
+# Everything below this line assumes nginx answers. On 2026-09-10 it stopped
+# answering: the single worker (worker_processes 1, see nginx.conf) spun at
+# 100% CPU in userspace and never accepted a connection again. The container
+# stayed "Up", so the restart policy saw nothing to restart, and this loop
+# kept ticking happily beside a dead server for thirty-one hours.
+#
+# The poll is the same /stat the session logic already depends on, which is
+# why a failure here has to skip the sweep below rather than let it run: with
+# /stat and /control both unreachable, session_force_stop's status read comes
+# back empty, the MAX_SESSION branch takes that for "nothing was recording",
+# and live bookings get finalized as failed. Doing nothing is strictly better.
+#
+# Escalation, in two steps:
+#
+#   LIVENESS_FAILS ticks down   -> SIGKILL the worker(s). The master respawns
+#                                  them, which is what fixed 2026-09-10 by
+#                                  hand, and costs only the current viewers a
+#                                  reconnect. Recordings survive: the session
+#                                  state is on /data and the parts are on disk.
+#   twice that, still down      -> the master is wedged too, so stop the
+#                                  container and let `restart: unless-stopped`
+#                                  rebuild it.
+#
+# Set 0 to disable the check entirely.
+LIVENESS_FAILS=${LIVENESS_FAILS:-6}
+LIVE_FAILS=0
+
+# `ps` isn't in the image, so read the worker pids straight out of /proc.
+# nginx rewrites its argv, so a worker's cmdline is its process title
+# verbatim - "nginx: worker process" - and the master is always pid 1 here.
+nginx_worker_pids() {
+    for _proc in /proc/[0-9]*; do
+        _wpid=${_proc#/proc/}
+        if [ "$_wpid" = 1 ]; then
+            continue
+        fi
+        _title=$(tr '\0' ' ' <"${_proc}/cmdline" 2>/dev/null) || _title=""
+        case "$_title" in
+            'nginx: worker process'*) printf '%s\n' "$_wpid" ;;
+        esac
+    done
+}
+
+rec_log "session watchdog started (idle limit ${TIMEOUT}s, max session ${MAX_SESSION}s, publisher state polled every ${INTERVAL}s, nginx liveness after ${LIVENESS_FAILS} failed poll(s))"
 
 while true; do
     sleep "$INTERVAL"
     NOW=$(date +%s)
+
+    # Is nginx answering at all? See the note above: when it isn't, the whole
+    # sweep below is skipped rather than run against a server that can't reply.
+    if [ "$LIVENESS_FAILS" -gt 0 ]; then
+        if curl -sf -m 5 -o /dev/null http://127.0.0.1/stat 2>/dev/null; then
+            if [ "$LIVE_FAILS" -gt 0 ]; then
+                rec_log "nginx liveness: /stat answering again after ${LIVE_FAILS} failed poll(s)"
+            fi
+            LIVE_FAILS=0
+        else
+            LIVE_FAILS=$((LIVE_FAILS + 1))
+            DOWN_FOR=$((LIVE_FAILS * INTERVAL))
+            rec_log "nginx liveness: /stat unanswered (${LIVE_FAILS}/${LIVENESS_FAILS}, ${DOWN_FOR}s)"
+
+            if [ "$LIVE_FAILS" -eq "$LIVENESS_FAILS" ]; then
+                # space-separated so it both logs and word-splits cleanly
+                WPIDS=$(nginx_worker_pids | tr '\n' ' ')
+                WPIDS=${WPIDS% }
+                if [ -n "$WPIDS" ]; then
+                    rec_log "nginx liveness: wedged ${DOWN_FOR}s - killing worker(s) ${WPIDS} so the master respawns them"
+                    for W in $WPIDS; do
+                        kill -9 "$W" 2>/dev/null || true
+                    done
+                else
+                    rec_log "nginx liveness: wedged ${DOWN_FOR}s and no worker process to kill - waiting to stop the container instead"
+                fi
+            elif [ "$LIVE_FAILS" -eq $((LIVENESS_FAILS * 2)) ]; then
+                rec_log "nginx liveness: still down after ${DOWN_FOR}s and a worker respawn - stopping the container for the restart policy"
+                kill -TERM 1 2>/dev/null || true
+            fi
+
+            continue
+        fi
+    fi
 
     # "is this camera sending video right now", reported when it changes.
     # Lives here because this is the only loop that already runs on a tick

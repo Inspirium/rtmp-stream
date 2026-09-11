@@ -76,6 +76,20 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/record-done.sh \
 ENV PATH="/usr/local/nginx/sbin:${PATH}"
 WORKDIR /usr/local/nginx
 
+# Visibility only - Docker's restart policy reacts to a container exiting,
+# never to an unhealthy one, so this recovers nothing by itself (that job is
+# session-watchdog.sh's liveness check). What it buys is that a wedged nginx
+# reads as "unhealthy" in `docker ps` instead of "Up 3 days", which is the
+# line that made the 2026-09-10 outage invisible for thirty-one hours.
+#
+# /stat is the honest probe here: it's served by the worker and rendered by
+# the rtmp module, so it only answers if the part that actually breaks - the
+# worker's event loop - is still turning. A static file would be served from
+# the same wedged loop and tell us nothing extra, but a TCP check on 1935
+# would have passed throughout the outage: that socket is held by the master.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -fsS -m 5 -o /dev/null http://127.0.0.1/stat || exit 1
+
 EXPOSE 80 443 1935
 VOLUME ["/tmp/rec", "/data", "/etc/letsencrypt"]
 
