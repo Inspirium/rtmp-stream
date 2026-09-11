@@ -573,6 +573,7 @@ worker would be invisible to `/stat` and `/control` on another.
 | `SPACES_PREFIX` | `recordings` | Key prefix inside the bucket |
 | `KEEP_LOCAL_RECORDINGS` | `false` | Keep local `.flv`/`.mp4` after a successful upload |
 | `RESUME_TIMEOUT` | `600` | Seconds a recording waits for a dropped publisher before finalizing without it — see [Reconnects and resumed recordings](#reconnects-and-resumed-recordings) |
+| `LIVENESS_FAILS` | `6` | Consecutive failed `/stat` polls before the watchdog treats nginx as wedged — kills the worker, then stops the container at twice the count |
 | `CLEANUP_INTERVAL` | `3600` | Seconds between sweeps of the recordings volume |
 | `RECORDING_RETENTION_DAYS` | `7` | How old a leftover file must be before a sweep will consider it |
 | `WEBHOOK_URL` | *(unset)* | Backend endpoint POSTed recording outcomes and camera recording status — see [Status webhook](#status-webhook) |
@@ -641,6 +642,7 @@ docker/
   record-done.sh              exec_record_done hook: banks each part, finalizes once the session is over
   record-finalize.sh          finalize a session by hand (docker exec)
   session-watchdog.sh         finalizes sessions whose publisher never came back (RESUME_TIMEOUT)
+                              and restarts a wedged nginx worker (LIVENESS_FAILS)
   cleanup-recordings.sh       sweeps leftovers off the recordings volume (hourly, and on demand)
   rec-session.sh              sourced: the session state machine on /data/rec-sessions
   rec-finalize.sh             sourced: join parts -> mp4, upload, status webhook
