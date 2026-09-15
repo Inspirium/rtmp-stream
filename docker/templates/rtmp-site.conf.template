@@ -29,6 +29,22 @@ server {
         wait_key on;
         wait_video on;
 
+        # A camera whose uplink dies without an RTMP teardown leaves its
+        # publisher registered here, and nginx-rtmp then refuses every
+        # reconnect with "live: already publishing" until the OS finally
+        # reaps the dead socket - the stream stays dark the whole time. One
+        # encoder on stream1 spent 2026-09-13 00:46-02:00 retrying four
+        # playback_ids every ~5s that way, 893 rejections, /auth/publish
+        # returning 200 each time because the keys were never the problem.
+        #
+        # 30s of no audio/video at all means the encoder is gone: frames
+        # arrive every ~40ms even on the long-GOP profiles some cameras
+        # push, so this is nowhere near a live publisher. The check rides
+        # the RTMP ping timer (nginx-rtmp's default 60s, not overridden in
+        # nginx.conf), so a drop lands within about a minute - against an
+        # outage measured in hours.
+        drop_idle_publisher 30s;
+
         # validated against stream_keys.map by /auth/publish (see
         # http-site.conf.template) - the ?key=... query param nginx-rtmp
         # parses off the publish path is what gets checked

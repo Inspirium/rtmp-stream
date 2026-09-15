@@ -676,6 +676,15 @@ html/
   is wrong, revoked, or being used to claim a playback ID it wasn't
   minted for. Re-check the exact publish URL from `mint-key.sh` /
   `POST /admin/keys`.
+- **Publish rejected (`already publishing` in the server log)** — a
+  previous publisher for that playback ID is still registered, which
+  happens when an encoder's uplink dies without an RTMP teardown. The
+  encoder retries, every attempt is refused, and the stream stays dark.
+  `drop_idle_publisher 30s` (in `templates/rtmp-site.conf.template`)
+  clears the stale session about a minute after the frames stop, so the
+  next reconnect is accepted; a burst of these lasting longer than that
+  means the encoder is reconnecting faster than it is publishing, not
+  that the server is holding the name.
 - **Recordings not uploading** — check `docker compose logs` for
   `SPACES_*` warnings at startup; a bad endpoint/credential doesn't
   crash the container, it just falls back to local-only recording.
