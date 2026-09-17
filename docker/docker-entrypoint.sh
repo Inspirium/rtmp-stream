@@ -117,6 +117,46 @@ RTMP_APP=stream
 EOF
 chmod 644 /data/.rec-config
 
+# --- relay sessions ------------------------------------------------------
+# relay-run.sh is spawned detached by a CGI and inherits nothing, same
+# problem and same fix as the recording scripts above.
+cat >/data/.relay-config <<EOF
+RELAY_RESUME_TIMEOUT=${RELAY_RESUME_TIMEOUT:-$RESUME_TIMEOUT}
+RELAY_FAST_FAIL_SECONDS=${RELAY_FAST_FAIL_SECONDS:-5}
+RELAY_FAST_FAIL_LIMIT=${RELAY_FAST_FAIL_LIMIT:-5}
+EOF
+chmod 644 /data/.relay-config
+
+# Unlike a recording session, a relay session cannot survive this restart
+# and must not pretend to. The whole session IS a running ffmpeg plus the
+# supervisor watching it, and both died with the old container - there is
+# no half-finished artefact on disk to resume, only a directory claiming a
+# broadcast is live when nothing is being sent to it.
+#
+# So they are cleared, and the backend is told why. It knows which
+# bookings should be streaming and restarts them on its next tick; that is
+# a much better place for the decision than here, because only it knows
+# whether the far end's broadcast is still open or has to be created
+# again. Saying nothing would leave a club's channel showing a live stream
+# that ended when this container did.
+mkdir -p /data/relay-sessions
+chmod 755 /data/relay-sessions
+for _r in /data/relay-sessions/*; do
+    [ -d "$_r" ] || continue
+    _id=$(basename "$_r")
+    rm -rf "$_r"
+    echo "[setup] relay session ${_id} did not survive the restart - reporting it stopped"
+    if [ -f /data/.webhook-env ]; then
+        # shellcheck disable=SC1091
+        . /data/.webhook-env
+        [ -n "${WEBHOOK_URL:-}" ] && curl -sf -m 10 -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${WEBHOOK_TOKEN:-}" \
+            -d "{\"playback_id\":\"${_id}\",\"event\":\"relay\",\"relaying\":false,\"reason\":\"server_restarted\"}" \
+            >/dev/null 2>&1 || true
+    fi
+done
+
 # Session state lives here rather than /tmp precisely so it survives this
 # restart: a booking interrupted by `docker compose up -d` picks up again
 # the moment its encoder reconnects (see rec-session.sh). 777 because both

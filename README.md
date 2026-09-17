@@ -19,6 +19,7 @@ compiled from source in the image.
 - [Recording](#recording)
   - [Reconnects and resumed recordings](#reconnects-and-resumed-recordings)
   - [Disk housekeeping](#disk-housekeeping)
+- [Relaying to another RTMP ingest (YouTube Live, Twitch, ...)](#relaying-to-another-rtmp-ingest-youtube-live-twitch-)
 - [Object storage (DigitalOcean Spaces / S3)](#object-storage-digitalocean-spaces--s3)
 - [Status webhook](#status-webhook)
 - [TLS / HTTPS](#tls--https)
@@ -278,6 +279,111 @@ never left the machine — that gets reported and kept until you pass
 `--force`. Parts of a session that's still open, and anything written in
 the last few minutes, are never touched at either setting.
 
+## Relaying to another RTMP ingest (YouTube Live, Twitch, ...)
+
+A **relay** re-publishes a live stream on to somebody else's ingest while
+it carries on being ingested, recorded and played back here exactly as
+before. The relay is an extra consumer of the stream, not a replacement
+for anything: stop it and nothing else on this box notices.
+
+Like recording, it is manual only — publishing alone never relays
+anything — and it is started and stopped over HTTP with the same basic
+auth (`CONTROL_USER` / `CONTROL_PASS`):
+
+```sh
+curl -u "$CONTROL_USER:$CONTROL_PASS" -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"<playback_id>","target":"rtmps://a.rtmps.youtube.com/live2/<stream-key>"}' \
+  "https://<DOMAIN>/control/relay/start"
+
+curl -u "$CONTROL_USER:$CONTROL_PASS" -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"<playback_id>"}' \
+  "https://<DOMAIN>/control/relay/stop"
+```
+
+`target` is the full ingest URL with the far end's **stream key as its
+last path component**. Both routes take a JSON body rather than the query
+string the recording routes use, and that difference is deliberate: nginx
+writes every query string it serves to the access log, and a stream key
+that reaches a log is a key that has to be rotated.
+
+A start returns `200` once the relay is running, `409` if this stream is
+already being relayed somewhere else, and `400` for a target that isn't
+an `rtmp://` or `rtmps://` URL of the form `scheme://host/app/key`.
+Repeating a start with the *same* target is a successful no-op, so a
+caller's scheduler is free to be idempotent. A stop returns `204` when
+there was nothing running, which is not an error — see below.
+
+**It does not wait for the far end.** A `200` means the relay is running
+locally, not that YouTube has accepted it; nothing here blocks on
+somebody else's ingest. What actually happened arrives on the status
+webhook (see below).
+
+### What gets sent
+
+The stream is **remuxed, never re-encoded**. A camera publishing 1080p30
+H.264 with a one-second keyframe interval is already exactly what these
+ingests want — inside YouTube's four-second keyframe maximum, and better
+than its two-second recommendation — so the video is copied through at
+almost no CPU cost. That is what makes several concurrent relays possible
+on a box that is also running the ingest; transcoding them would need a
+different machine.
+
+Audio is the one thing that may need work, because every ingest worth
+naming wants an audio track and a video-only broadcast simply never
+starts:
+
+| source audio | what is sent |
+| --- | --- |
+| AAC | copied through, free |
+| anything else | transcoded to AAC (a few percent of a core) |
+| none | silence is synthesised |
+
+### Reconnects
+
+ffmpeg exits the moment its input ends, which here means every time the
+camera's uplink blinks. A supervisor (`relay-run.sh`) restarts it, so the
+relay survives a drop the same way a recording session does — and for the
+same reason: the session is the unit that survives, the process
+underneath it is disposable.
+
+A relay ends on its own in three cases, each reported with a stable
+`reason` slug:
+
+| `reason` | what happened |
+| --- | --- |
+| `stopped` | somebody called `/control/relay/stop` |
+| `publisher_gone` | the camera stayed away past `RELAY_RESUME_TIMEOUT` (default: `RESUME_TIMEOUT`, 600s) |
+| `target_rejected` | ffmpeg died instantly, repeatedly, *while the camera was publishing normally* — so it is the far end refusing us: a revoked key, a channel that isn't live-enabled, a typo'd URL |
+| `server_restarted` | the container went down; a relay cannot survive that (see below) |
+
+Because a relay can end itself, a later `/control/relay/stop` for the same
+booking legitimately finds nothing to stop and answers `204`.
+
+### Restarts
+
+Unlike a recording session, **a relay session does not survive a
+container restart**, and does not pretend to. The whole session is a
+running ffmpeg plus the supervisor watching it, and both die with the
+container — there is no half-finished artefact on disk to resume, only a
+directory claiming a broadcast is live when nothing is being sent to it.
+
+So they are cleared at startup and each one is reported stopped with
+`server_restarted`. Restarting them is the backend's call, not this
+container's: only the backend knows whether the far end's broadcast is
+still open or has to be created again.
+
+### Why ffmpeg and not nginx-rtmp's `push`
+
+nginx-rtmp has a `push` directive that does roughly this. It is the wrong
+tool here on three counts: it lives in static config, so adding a
+destination means rewriting `nginx.conf` and reloading; it has no notion
+of per-stream targets chosen at runtime, which is the entire use case;
+and it cannot speak **RTMPS**, which is the only thing some ingests
+accept and the only sane choice for carrying a stream key across the
+public internet.
+
 ## Object storage (DigitalOcean Spaces / S3)
 
 Set in `.env` (or via `setup.sh`):
@@ -449,6 +555,29 @@ that stamps the end of its coverage from `"recording": false` gets a
 timestamp up to `RESUME_TIMEOUT` after the last frame was actually
 written, and that trailing gap is what tells it so.
 
+**Relay status** (`relay-start.cgi` / `relay-run.sh` / `relay-stop.cgi`)
+— whether this stream is currently being re-published to another ingest
+(see [Relaying](#relaying-to-another-rtmp-ingest-youtube-live-twitch-)):
+
+```json
+{
+  "playback_id": "<playback_id>",
+  "event": "relay",
+  "relaying": false,
+  "reason": "target_rejected"
+}
+```
+
+Sent `true` when a relay starts and `false` when it ends, with a `reason`
+on the `false` (`stopped`, `publisher_gone`, `target_rejected`,
+`server_restarted`, `no_target`). Like the recording flag, it is *not*
+flapped when the publisher drops and the relay's ffmpeg is respawned
+underneath it — the relay is still up as far as anyone is concerned.
+
+Note that `"relaying": true` means the relay is running here, not that
+the far end has accepted it. `target_rejected` arriving a few seconds
+later is how you learn it hadn't.
+
 Both requests carry `Authorization: Bearer <WEBHOOK_TOKEN>` so the
 receiving backend can tell which server sent them; leave
 `WEBHOOK_TOKEN` blank if the endpoint doesn't need one. Nothing is sent
@@ -608,6 +737,12 @@ first start. Set them explicitly in `.env` to pin them across restarts.
   `/internal/control/record/start`) are restricted to `127.0.0.1`.
 - Recording is opt-in per stream — nothing is ever recorded just by
   publishing.
+- A relay `target` is the far end's stream key. It is accepted in a
+  request body and never in a URL, so it does not reach nginx's access
+  log, and it is stored mode `600` on `/data` — but it is still a
+  credential for somebody else's channel sitting on this disk. Anyone
+  with `CONTROL_USER`/`CONTROL_PASS` can start a relay to any ingest they
+  like, so treat those as able to rebroadcast every stream on the box.
 - `WEBHOOK_TOKEN` is sent outbound to `WEBHOOK_URL` on every recording
   and every recording start/stop —
   use an `https://` URL or it's a plain secret on the wire, same as the
@@ -646,6 +781,10 @@ docker/
   cleanup-recordings.sh       sweeps leftovers off the recordings volume (hourly, and on demand)
   rec-session.sh              sourced: the session state machine on /data/rec-sessions
   rec-finalize.sh             sourced: join parts -> mp4, upload, status webhook
+  relay-start.cgi             opens a relay session and spawns its supervisor (POST /control/relay/start)
+  relay-stop.cgi              ends a relay session and signals its ffmpeg (POST /control/relay/stop)
+  relay-run.sh                the relay supervisor: keeps one ffmpeg re-publishing to the far end
+  relay-session.sh            sourced: the relay state machine on /data/relay-sessions
 
 html/
   player.html                 minimal HLS test player + recording controls

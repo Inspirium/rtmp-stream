@@ -56,21 +56,28 @@ COPY docker/revoke-key.sh         /usr/local/bin/revoke-key.sh
 COPY docker/admin-api.cgi         /usr/local/bin/admin-api.cgi
 COPY docker/record-start.cgi      /usr/local/bin/record-start.cgi
 COPY docker/record-stop.cgi       /usr/local/bin/record-stop.cgi
+COPY docker/relay-run.sh          /usr/local/bin/relay-run.sh
+COPY docker/relay-start.cgi       /usr/local/bin/relay-start.cgi
+COPY docker/relay-stop.cgi        /usr/local/bin/relay-stop.cgi
 # sourced, not executed - the session state machine (rec-session.sh) and
-# the join/upload half of it (rec-finalize.sh), shared by all of the above
+# the join/upload half of it (rec-finalize.sh), shared by all of the above.
+# relay-session.sh is the same idea for relays, and sources rec-session.sh
+# itself for the logging and webhook helpers the two have in common.
 COPY docker/rec-session.sh        /usr/local/bin/rec-session.sh
 COPY docker/rec-finalize.sh       /usr/local/bin/rec-finalize.sh
+COPY docker/relay-session.sh      /usr/local/bin/relay-session.sh
 
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/record-done.sh \
              /usr/local/bin/record-resume.sh /usr/local/bin/record-finalize.sh \
              /usr/local/bin/session-watchdog.sh /usr/local/bin/cleanup-recordings.sh \
              /usr/local/bin/mint-key.sh /usr/local/bin/revoke-key.sh \
              /usr/local/bin/admin-api.cgi /usr/local/bin/record-start.cgi \
-             /usr/local/bin/record-stop.cgi \
+             /usr/local/bin/record-stop.cgi /usr/local/bin/relay-run.sh \
+             /usr/local/bin/relay-start.cgi /usr/local/bin/relay-stop.cgi \
     && mkdir -p /usr/local/nginx/conf/conf.d /usr/local/nginx/conf/rtmp.d \
                /usr/local/nginx/conf/site-locations \
                /tmp/rec /tmp/hls /tmp/dash /tmp/rec-pending \
-               /data /data/rec-sessions \
+               /data /data/rec-sessions /data/relay-sessions \
                /var/www/certbot
 
 ENV PATH="/usr/local/nginx/sbin:${PATH}"

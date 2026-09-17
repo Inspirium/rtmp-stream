@@ -119,6 +119,39 @@ location = /internal/control/record/stop {
     rtmp_control all;
 }
 
+# --- start relaying this stream on to another RTMP ingest ----------
+# Re-publishes a live stream to somebody else's ingest (YouTube Live,
+# Twitch, a club's own server) while it carries on being ingested,
+# recorded and played back here exactly as before. See relay-run.sh for
+# why a supervised ffmpeg rather than nginx-rtmp's own `push`: push is
+# static config, needs a reload to change a destination, and cannot
+# speak rtmps - which some ingests are the only thing they accept.
+#
+# Takes a JSON body, unlike the recording routes above, because the
+# target's last path component is the far end's stream key and nginx
+# writes every query string it serves to the access log. See
+# relay-start.cgi.
+#   POST /control/relay/start  {"name":"<playback_id>","target":"rtmps://.../<key>"}
+location = /control/relay/start {
+    auth_basic           "stream control";
+    auth_basic_user_file /usr/local/nginx/conf/control.htpasswd;
+
+    include fastcgi_params;
+    fastcgi_param SCRIPT_FILENAME /usr/local/bin/relay-start.cgi;
+    fastcgi_pass unix:/run/fcgiwrap.sock;
+}
+
+# --- stop relaying -------------------------------------------------
+#   POST /control/relay/stop  {"name":"<playback_id>"}
+location = /control/relay/stop {
+    auth_basic           "stream control";
+    auth_basic_user_file /usr/local/nginx/conf/control.htpasswd;
+
+    include fastcgi_params;
+    fastcgi_param SCRIPT_FILENAME /usr/local/bin/relay-stop.cgi;
+    fastcgi_pass unix:/run/fcgiwrap.sock;
+}
+
 # --- rtmp-module control API ---------------------------------------
 # drop publishers, redirect, etc. Recording start/stop are handled by
 # the two exact-match locations above, which take priority over this
