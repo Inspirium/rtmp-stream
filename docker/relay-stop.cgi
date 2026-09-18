@@ -49,8 +49,17 @@ esac
 
 . /usr/local/bin/relay-session.sh
 
+# Bounded, and it proceeds without the lock rather than giving up.
+#
+# A stop that blocks is worse than a stop that races: whatever is wrong
+# here, the thing on the other end is still broadcasting, and killing the
+# supervisor by pid is safe whether or not we hold the lock. The
+# unbounded `flock -x 9` this replaces is exactly how a relay once ran on
+# for nine minutes after it was stopped.
 exec 9>"$(relay_lock_path "$NAME")"
-flock -x 9
+if ! flock -w 10 -x 9; then
+    rec_log "relay ${NAME}: could not take the session lock in 10s - stopping anyway"
+fi
 
 if ! relay_exists "$NAME"; then
     respond "204 No Content"

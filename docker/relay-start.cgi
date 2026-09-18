@@ -112,7 +112,16 @@ relay_create "$NAME" "$TARGET"
 # moment nginx got its response. stdin closed and output redirected for
 # the same reason: anything still holding the CGI's pipes keeps the
 # request open, and nginx sits waiting on a response it already has.
-setsid /usr/local/bin/relay-run.sh "$NAME" </dev/null >/dev/null 2>&1 &
+#
+# 9>&- is not optional and cost a live broadcast to learn. fd 9 is the
+# flock this CGI is holding, and a child inherits it: without this the
+# supervisor holds the relay's lock for its entire life, every later
+# /control/relay/stop blocks forever on `flock -x 9`, nginx logs a 499
+# when the caller gives up, and the relay keeps pushing to somebody's
+# channel long after they pressed stop. Closing it here is what makes the
+# lock mean "a CGI is mutating this session" rather than "this session
+# exists".
+setsid /usr/local/bin/relay-run.sh "$NAME" </dev/null >/dev/null 2>&1 9>&- &
 
 rec_log "relay ${NAME}: session opened for $(relay_redact "$TARGET")"
 respond "200 OK" '{"status":"relaying"}'
