@@ -117,6 +117,35 @@ session_create() {
 
 session_destroy() { rm -rf "$(session_dir "$1")" 2>/dev/null || true; }
 
+# Move a finishing session out of its playback_id's slot, so a new booking
+# on the same camera can open a session while this one is still being
+# joined and uploaded (see finalize_session). Echoes the new id - the
+# playback_id plus a `.fin-` suffix - which every session_* helper accepts
+# like any other. The detached copy keeps state=stopping, so the watchdog's
+# sweep and record-resume.sh, which only act on active sessions in the
+# live slot, leave it alone. Must be called with the playback_id's lock.
+#
+# A detached session that is still here after a restart was interrupted
+# mid-upload; session-watchdog.sh finalizes those again at startup.
+session_detach() {
+    _fin="$1.fin-$(date +%s)-$$"
+    session_set "$1" state stopping
+    if mv "$(session_dir "$1")" "$(session_dir "$_fin")" 2>/dev/null; then
+        printf '%s' "$_fin"
+    else
+        # Still finalizable where it is, just not concurrently with a new
+        # booking - the caller sees the same id back and keeps the lock.
+        rec_log "session $1: could not move it aside for finalizing - finalizing in place"
+        printf '%s' "$1"
+    fi
+}
+
+# Is this a session session_detach moved aside?
+session_is_detached() {
+    case "$1" in *.fin-*) return 0 ;; esac
+    return 1
+}
+
 session_unset() { rm -f "$(session_dir "$1")/$2" 2>/dev/null || true; }
 
 session_add_part() {

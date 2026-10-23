@@ -49,15 +49,62 @@ fi
 
 . /usr/local/bin/rec-session.sh
 
-# Serialize against a record-done.sh still finalizing this playback_id's
-# previous session - it destroys the session directory when it's done, and
-# would take a session opened here down with it.
+# Serialize against record-done.sh / record-stop.cgi working on this
+# playback_id's previous session. They only hold this lock for the quick
+# bookkeeping: the slow join and upload run after the session has been
+# moved out of the way (see finalize_session), so this waits seconds, not
+# the length of an upload.
 exec 9>"$(lock_path "$NAME")"
 flock -x 9
 
-# An empty name is fine and means "no ?filename= was given": rec-finalize.sh
-# then falls back to the raw timestamped name nginx-rtmp gave the first part.
-session_create "$NAME" "$FILENAME"
+# A stop that has closed the recorder but whose record-done.sh hasn't run
+# yet leaves the previous booking here as `stopping`. Its last part is on
+# its way to it, and a session created over it now would receive that part
+# instead - the previous booking's ending, filed as a dropout in this one.
+# record-done.sh moves it aside within a moment of getting the lock, so
+# hand the lock over and wait for that.
+_waited=0
+while session_exists "$NAME" && [ "$(session_get "$NAME" state)" = stopping ] && [ "$_waited" -lt 10 ]; do
+    flock -u 9
+    sleep 1
+    flock -x 9
+    _waited=$((_waited + 1))
+done
+if session_exists "$NAME" && [ "$(session_get "$NAME" state)" = stopping ]; then
+    rec_log "session ${NAME}: previous session still stopping after ${_waited}s - opening the new one over it"
+    session_destroy "$NAME"
+fi
+
+# An active session already here means this camera is already booked for
+# recording. It happens when a start is retried - the caller timed out on
+# an earlier one that went through anyway - and it is the caller's latest
+# word on what the recording is called. Take the session over rather than
+# reset it: resetting threw away its parts and set it "not recording" while
+# the recorder was running, so the watchdog later closed it as no_footage
+# and the real footage was uploaded under a name nobody was waiting for.
+_created=0
+if session_exists "$NAME" && [ "$(session_get "$NAME" state)" = active ]; then
+    _previous=$(session_get "$NAME" name)
+    if [ -n "$FILENAME" ] && [ "$FILENAME" != "$_previous" ]; then
+        session_set "$NAME" name "$FILENAME"
+        session_set "$NAME" started "$(date +%s)"
+        rec_log "session ${NAME}: start for ${FILENAME}.mp4 while already open${_previous:+ as ${_previous}.mp4} - continuing the same recording under the new name"
+    fi
+
+    if [ "$(session_get "$NAME" recording)" = 1 ]; then
+        # nginx-rtmp would answer 204 to a second start, which reads as
+        # "nothing publishing" - the opposite of the truth
+        rec_log "session ${NAME}: already recording${FILENAME:+ as ${FILENAME}.mp4}"
+        send_camera_status "$NAME" true
+        respond "200 OK"
+    fi
+else
+    # An empty name is fine and means "no ?filename= was given":
+    # rec-finalize.sh then falls back to the raw timestamped name nginx-rtmp
+    # gave the first part.
+    session_create "$NAME" "$FILENAME"
+    _created=1
+fi
 
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
     "http://127.0.0.1/internal/control/record/start?app=${APP}&name=${NAME}&rec=${REC}")
@@ -96,7 +143,10 @@ case "$STATUS" in
 esac
 
 # anything else really is a refusal - don't leave a session behind for
-# record-resume.sh to act on the next time this stream publishes
-session_destroy "$NAME"
+# record-resume.sh to act on the next time this stream publishes. One we
+# took over stays: it has parts of a booking already in it.
+if [ "$_created" -eq 1 ]; then
+    session_destroy "$NAME"
+fi
 rec_log "session ${NAME}: record/start refused by nginx-rtmp (status ${STATUS})"
 respond "$STATUS"

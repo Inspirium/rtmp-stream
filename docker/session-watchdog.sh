@@ -78,6 +78,17 @@ nginx_worker_pids() {
     done
 }
 
+# A session detached for finalizing (see session_detach) is only ever
+# worked on by the finalize that detached it. One still here at startup
+# lost that finalize to the restart, so nothing else will ever pick it up:
+# join and upload it again now. In the background, so a long upload
+# doesn't hold up the sweep below for the bookings that are live.
+for ID in $(session_ids); do
+    session_is_detached "$ID" || continue
+    rec_log "session ${ID}: detached for finalizing when the container went down - finalizing it again"
+    record-finalize.sh "$ID" &
+done
+
 rec_log "session watchdog started (idle limit ${TIMEOUT}s, max session ${MAX_SESSION}s, publisher state polled every ${INTERVAL}s, nginx liveness after ${LIVENESS_FAILS} failed poll(s))"
 
 while true; do
