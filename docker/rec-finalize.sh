@@ -38,6 +38,10 @@ finalize_session() {
     # leaving whatever record-start or the watchdog managed to catch.
     session_capture_codec "$_id"
 
+    # A part whose recorder died with its nginx worker is still on disk;
+    # bring it in before anything below counts or joins the parts.
+    session_adopt_unbanked "$_id"
+
     # the camera really has stopped recording by the time we get here,
     # whatever happens to the file below - tell the backend first, before
     # any of the parts that can fail

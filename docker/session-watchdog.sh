@@ -113,6 +113,22 @@ while true; do
                 WPIDS=$(nginx_worker_pids | tr '\n' ' ')
                 WPIDS=${WPIDS% }
                 if [ -n "$WPIDS" ]; then
+                    # Every recorder dies with its worker, and a killed worker
+                    # never runs exec_record_done - so nothing would ever set
+                    # these sessions' `recording` back to 0, and
+                    # record-resume.sh skips a session that says it is
+                    # recording. The cameras reconnect within seconds of the
+                    # respawn and the rest of each booking would go
+                    # unrecorded. Mark them dropped first, as record-done.sh
+                    # would have; the orphaned part is banked when the
+                    # session finalizes (session_adopt_unbanked).
+                    for ID in $(session_ids); do
+                        [ "$(session_get "$ID" state)" = active ] || continue
+                        [ "$(session_get "$ID" recording)" = 1 ] || continue
+                        session_set "$ID" recording 0
+                        [ -n "$(session_get "$ID" gap_open)" ] || gap_open "$ID"
+                        rec_log "session ${ID}: recorder goes down with the worker - marked dropped, resumes on reconnect"
+                    done
                     rec_log "nginx liveness: wedged ${DOWN_FOR}s - killing worker(s) ${WPIDS} so the master respawns them"
                     for W in $WPIDS; do
                         kill -9 "$W" 2>/dev/null || true
