@@ -16,6 +16,15 @@ services:
     volumes:
       - rec-data:/tmp/rec
       - key-data:/data
+    # Live HLS/DASH segments in RAM. They are rewritten every half second
+    # for every camera and deleted ten seconds later, and on the spinning
+    # RAID1 under stream1 that churn alone kept the disks ~80% busy - any
+    # other IO on top (a big upload, a backup) stalled nginx past the
+    # liveness check and took live view down. Nothing here needs to
+    # survive a restart; together they hold a few hundred MB.
+    tmpfs:
+      - /tmp/hls:size=1g,mode=1777
+      - /tmp/dash:size=2g,mode=1777
 
 volumes:
   rec-data:
