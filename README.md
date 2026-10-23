@@ -246,6 +246,29 @@ Sessions live on the `/data` volume, so they also survive the container
 being restarted mid-booking: `docker compose up -d` to change a setting
 no longer costs you the recording, it just becomes another part.
 
+### Back-to-back bookings
+
+Joining and uploading a finished session can take minutes for a long
+booking. It no longer holds up the camera: the finished session is moved
+aside (to `<playback_id>.fin-…` in `/data/rec-sessions`) and uploaded
+from there, so the next booking's `record/start` answers straight away.
+Finalizes of the same camera still run one at a time, in order. One that
+a restart interrupts is finalized again at startup, under the name it had
+already picked.
+
+`record/start` on a camera that already has an open session does not
+start over. It continues the same recording under the new `filename`,
+keeping the parts recorded so far, and answers `200` if a recorder is
+running (`202` if the session is still waiting for its camera). This is
+what a caller retrying a start it timed out on needs. Before, the retry
+reset the session to "not recording" under the running recorder, and the
+footage was later uploaded under a name nobody was waiting for, while the
+name that was waited on came back as `no_footage`.
+
+A `record/start` that arrives while the previous session's stop is still
+closing its recorder waits for that, up to 10 seconds, so the previous
+booking's last part is not filed under the new one.
+
 To see what's currently open, and to force one to finish early:
 
 ```sh

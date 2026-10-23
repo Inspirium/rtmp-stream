@@ -5,25 +5,38 @@
 # Sourced (never executed) by record-done.sh, record-finalize.sh and
 # session-watchdog.sh. rec-session.sh must be sourced first.
 #
-# THE CALLER MUST ALREADY HOLD that playback_id's flock (see record-done.sh)
-# - record-done.sh holds it for its whole run, so re-taking it here would
-# deadlock against ourselves. record-finalize.sh is the wrapper that takes
-# the lock for callers who don't hold it yet.
+# THE CALLER MUST ALREADY HOLD that playback_id's flock ON FD 9 (see
+# record-done.sh) - re-taking it here would deadlock against ourselves.
+# record-finalize.sh is the wrapper that takes the lock for callers who
+# don't hold it yet.
+#
+# The lock is RELEASED part way through. Only the quick bookkeeping runs
+# under it; the session is then moved out of the playback_id's slot
+# (session_detach) and the slow part - joining the parts, probing them,
+# uploading - runs on the detached copy with fd 9 unlocked. Holding the
+# lock through an upload is what lost bookings in October 2026: a 2.7 GB
+# upload kept the next booking's /control/record/start waiting fifteen
+# minutes, the backend gave up on it after 30 s and retried with a fresh
+# filename every minute, and when the lock finally freed the queued starts
+# ran one after another - the first started the recorder under a name the
+# backend had already thrown away, the rest re-armed the session over it,
+# and the footage ended up uploaded under a name nobody was waiting for.
+#
+# Finalizes of one playback_id are still serialized among themselves, on a
+# lock of their own, so two of them can't pick the same free .mp4 name and
+# their webhooks stay in order. That lock is never held by anything a
+# start, a stop or a reconnect waits on.
 
 # usage: finalize_session <playback_id>
 finalize_session() {
     _id=$1
     load_rec_config
 
-    _name=$(session_get "$_id" name)
-    _rec_dir=${REC_DIR:-/tmp/rec}
-
     # Last chance to learn the codec. On an explicit /control/record/stop
     # the camera is usually still publishing, so /stat still has it; on a
     # watchdog timeout the publisher is long gone and this does nothing,
     # leaving whatever record-start or the watchdog managed to catch.
     session_capture_codec "$_id"
-    _codec=$(session_get "$_id" video_codec)
 
     # the camera really has stopped recording by the time we get here,
     # whatever happens to the file below - tell the backend first, before
@@ -62,25 +75,64 @@ finalize_session() {
             ;;
     esac
 
+    # Everything from here on is slow, and none of it needs the live slot:
+    # move the session aside and let the next booking have the camera.
+    _fid=$(session_detach "$_id")
+    if [ "$_fid" != "$_id" ]; then
+        flock -u 9 2>/dev/null || true
+    fi
+
+    _frc=0
+    finalize_detached "$_fid" "$_id" || _frc=$?
+    return "$_frc"
+}
+
+# The slow half of finalize_session(), on a session already moved out of
+# its playback_id's slot by session_detach. Also what record-finalize.sh
+# runs for a detached session a restart interrupted mid-upload.
+#
+# usage: finalize_detached <detached_session_id> <playback_id>
+finalize_detached() {
+    _sid=$1
+    _id=$2
+    load_rec_config
+
+    exec 8>"$(lock_path "${_id}.finalize")"
+    flock -x 8
+
+    _ffrc=0
+    _finalize_parts || _ffrc=$?
+
+    exec 8>&-
+    return "$_ffrc"
+}
+
+# Body of finalize_detached, split out so the finalize lock above is
+# released on every one of its return paths. Reads _sid/_id from there.
+_finalize_parts() {
+    _name=$(session_get "$_sid" name)
+    _codec=$(session_get "$_sid" video_codec)
+    _rec_dir=${REC_DIR:-/tmp/rec}
+
     # Did the publisher drop at any point? Only then is it worth measuring
     # each part, which costs an ffprobe apiece - the common case is one
     # unbroken part and no measuring at all.
     _has_gaps=0
-    if [ -n "$(session_gaps "$_id")" ]; then
+    if [ -n "$(session_gaps "$_sid")" ]; then
         _has_gaps=1
     fi
 
     # drop zero-byte parts: a publisher that connected but never delivered a
     # keyframe before dropping again leaves one behind, and ffmpeg's concat
     # demuxer chokes on them
-    _list=$(session_dir "$_id")/concat.txt
-    _meta=$(session_dir "$_id")/parts.meta
+    _list=$(session_dir "$_sid")/concat.txt
+    _meta=$(session_dir "$_sid")/parts.meta
     : >"$_list"
     : >"$_meta"
     _count=0
     _idx=0
     _first=""
-    for _p in $(session_parts "$_id"); do
+    for _p in $(session_parts "$_sid"); do
         _idx=$((_idx + 1))
         [ -s "$_p" ] || { rec_log "skipping empty part ${_p}"; continue; }
         printf "file '%s'\n" "$_p" >>"$_list"
@@ -101,7 +153,7 @@ finalize_session() {
         rec_log "session ${_id} finished with no usable footage - nothing to upload"
         _key_name=${_name:-$_id}
         send_video_status "${_key_name}.mp4" failed "" "" no_footage "$_codec"
-        session_destroy "$_id"
+        session_destroy "$_sid"
         return 0
     fi
 
@@ -111,22 +163,18 @@ finalize_session() {
         _name=$(basename "$_first" .flv)
     fi
 
-    _mp4="${_rec_dir}/${_name}.mp4"
-    _n=2
-    while target_taken "$_mp4"; do
-        if [ "$_n" -gt 50 ]; then
-            # 50 recordings under one name is not a real scenario - reaching
-            # here means the "is this taken?" check itself is broken (a
-            # bucket listing answering yes to everything, say). Bail out to
-            # a name nothing can collide with rather than spin forever
-            # holding this playback_id's lock, which would wedge the stream.
-            _mp4="${_rec_dir}/${_name}-$(date +%s).mp4"
-            rec_log "no free name for ${_name}.mp4 after ${_n} tries - falling back to $(basename "$_mp4")"
-            break
-        fi
-        _mp4="${_rec_dir}/${_name}-${_n}.mp4"
-        _n=$((_n + 1))
-    done
+    # A finalize a restart interrupted has already picked its name, and
+    # what it left at that name - locally, or in the bucket if the upload
+    # finished before the webhook could go out - is its own output, not an
+    # earlier recording to step around. Picking again would report it under
+    # a -2 name the backend never handed out.
+    _mp4=$(session_get "$_sid" output)
+    if [ -n "$_mp4" ]; then
+        rec_log "session ${_id}: finalizing again into $(basename "$_mp4"), the name picked before the interruption"
+    else
+        _mp4=$(pick_output_name "${_rec_dir}/${_name}.mp4")
+        session_set "$_sid" output "$_mp4"
+    fi
     _base=$(basename "$_mp4")
 
     if [ "$_count" -eq 1 ]; then
@@ -136,7 +184,7 @@ finalize_session() {
                 -c copy -movflags +faststart "$_mp4"; then
             rec_log "ffmpeg remux FAILED for ${_base} - keeping ${_first}"
             send_video_status "$_base" failed "" "" remux_failed "$_codec"
-            session_destroy "$_id"
+            session_destroy "$_sid"
             return 1
         fi
     else
@@ -150,7 +198,7 @@ finalize_session() {
                 -c copy -movflags +faststart "$_mp4"; then
             rec_log "ffmpeg concat FAILED for ${_base} - keeping parts in ${_rec_dir}"
             send_video_status "$_base" failed "" "" concat_failed "$_codec"
-            session_destroy "$_id"
+            session_destroy "$_sid"
             return 1
         fi
     fi
@@ -172,20 +220,20 @@ finalize_session() {
             -of csv=p=0 "$_mp4" 2>/dev/null | grep -q video; then
         rec_log "no video stream in ${_base} - encoder is probably publishing H.265 or sending no keyframes; keeping ${_mp4}"
         send_video_status "$_base" failed "" "" no_video_track "$_codec"
-        session_destroy "$_id"
+        session_destroy "$_sid"
         return 1
     fi
 
     if [ "${UPLOAD_ENABLED:-false}" != true ]; then
         rec_log "object storage not configured, keeping ${_mp4} local"
-        session_destroy "$_id"
+        session_destroy "$_sid"
         return 0
     fi
 
     if ! load_s3_env; then
         rec_log "${S3_ENV_FILE} missing, cannot upload ${_base}"
         send_video_status "$_base" failed "" "" storage_unconfigured "$_codec"
-        session_destroy "$_id"
+        session_destroy "$_sid"
         return 1
     fi
 
@@ -193,19 +241,45 @@ finalize_session() {
     if s5cmd --endpoint-url "$S3_ENDPOINT_URL" --log error cp "$_mp4" "$_dest" >/dev/null 2>&1; then
         _size=$(wc -c <"$_mp4" | tr -d ' ')
         rec_log "uploaded ${_base} to ${_dest} (${_count} part(s), ${_size} bytes)"
-        send_video_status "$_base" ready "$_size" "$(gaps_json "$_id" "$_meta")" "" "$_codec"
+        send_video_status "$_base" ready "$_size" "$(gaps_json "$_sid" "$_meta")" "" "$_codec"
         if [ "${KEEP_LOCAL_RECORDINGS:-false}" != true ]; then
             rm -f "$_mp4"
-            for _p in $(session_parts "$_id"); do rm -f "$_p"; done
+            for _p in $(session_parts "$_sid"); do rm -f "$_p"; done
         fi
-        session_destroy "$_id"
+        session_destroy "$_sid"
         return 0
     fi
 
     rec_log "upload FAILED for ${_base}, keeping local copies in ${_rec_dir}"
     send_video_status "$_base" failed "" "" upload_failed "$_codec"
-    session_destroy "$_id"
+    session_destroy "$_sid"
     return 1
+}
+
+# The first name at or after $1 (an .mp4 path) that neither the local disk
+# nor the bucket already has: $1 itself, then -2, -3 ...
+#
+# usage: pick_output_name <path.mp4>
+pick_output_name() {
+    _mp4=$1
+    _stem=${1%.mp4}
+    _n=2
+    while target_taken "$_mp4"; do
+        if [ "$_n" -gt 50 ]; then
+            # 50 recordings under one name is not a real scenario - reaching
+            # here means the "is this taken?" check itself is broken (a
+            # bucket listing answering yes to everything, say). Bail out to
+            # a name nothing can collide with rather than spin forever
+            # holding this playback_id's finalize lock, which would hold up
+            # every later recording on this camera.
+            _mp4="${_stem}-$(date +%s).mp4"
+            rec_log "no free name for $(basename "$1") after ${_n} tries - falling back to $(basename "$_mp4")"
+            break
+        fi
+        _mp4="${_stem}-${_n}.mp4"
+        _n=$((_n + 1))
+    done
+    printf '%s' "$_mp4"
 }
 
 # Would writing this .mp4 clobber an earlier recording? Checks object
