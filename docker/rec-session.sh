@@ -151,8 +151,61 @@ session_unset() { rm -f "$(session_dir "$1")/$2" 2>/dev/null || true; }
 session_add_part() {
     _d=$(session_dir "$1")
     mkdir -p "$_d" 2>/dev/null || true
+    # idempotent: session_adopt_unbanked may already have picked this part up
+    if grep -qxF "$2" "$_d/parts" 2>/dev/null; then
+        return 0
+    fi
     printf '%s\n' "$2" >>"$_d/parts" 2>/dev/null || true
     chmod 666 "$_d/parts" 2>/dev/null || true
+    session_set "$1" updated "$(date +%s)"
+}
+
+# Bank any of this playback_id's .flv files that were written during the
+# session but never reached it as a part. A recorder normally hands its file
+# over through exec_record_done -> record-done.sh, but an nginx worker that
+# is killed (session-watchdog.sh does this when nginx wedges) never runs
+# it: the file sits in REC_DIR unreferenced, the join at stop leaves it out,
+# and a booking whose only footage it was is reported no_footage. On
+# 2026-10-23 that had happened to seven bookings in five days.
+#
+# Only files that have been idle for a minute are taken - a recorder that
+# is still writing will bank its own file when it closes. Afterwards the
+# parts are put back in recording order (nginx-rtmp names them
+# <playback_id>-<epoch>-...), so an adopted part lands where it belongs.
+# The caller must hold the playback_id's lock.
+#
+# usage: session_adopt_unbanked <playback_id>
+session_adopt_unbanked() {
+    _started=$(session_get "$1" started)
+    case "$_started" in ''|*[!0-9]*) return 0 ;; esac
+    _adir=$(session_dir "$1")
+    _idle_before=$(( $(date +%s) - 60 ))
+    _adopted=0
+    for _f in "${REC_DIR:-/tmp/rec}/$1"-*.flv; do
+        [ -s "$_f" ] || continue
+        grep -qxF "$_f" "$_adir/parts" 2>/dev/null && continue
+        _m=$(stat -c %Y "$_f" 2>/dev/null) || continue
+        [ "$_m" -ge "$_started" ] || continue
+        [ "$_m" -lt "$_idle_before" ] || continue
+        printf '%s\n' "$_f" >>"$_adir/parts" 2>/dev/null || continue
+        rec_log "session $1: banked $(basename "$_f"), which its recorder never handed over (worker killed?)"
+        _adopted=$((_adopted + 1))
+        # Every gap is stored as "<started> <ended> <parts before it>", and
+        # a gap that opened after this part began was counted without it -
+        # which would place it too early in the joined file.
+        _pe=$(basename "$_f" | awk -v id="$1" '{ sub("^" id "-", ""); split($0, a, "-"); print a[1] }')
+        if [ -f "$_adir/gaps" ]; then
+            awk -v e="$_pe" '$1 >= e { $3 = $3 + 1 } { print }' "$_adir/gaps" >"$_adir/gaps.new" 2>/dev/null \
+                && mv "$_adir/gaps.new" "$_adir/gaps" 2>/dev/null
+            chmod 666 "$_adir/gaps" 2>/dev/null || true
+        fi
+    done
+    [ "$_adopted" -gt 0 ] || return 0
+    # sort by the epoch nginx-rtmp puts after the playback_id
+    awk -v id="$1" '{ n = $0; sub(".*/" id "-", "", n); split(n, a, "-"); print a[1] "\t" $0 }' "$_adir/parts" \
+        | sort -n | cut -f2- >"$_adir/parts.sorted" 2>/dev/null \
+        && mv "$_adir/parts.sorted" "$_adir/parts" 2>/dev/null
+    chmod 666 "$_adir/parts" 2>/dev/null || true
     session_set "$1" updated "$(date +%s)"
 }
 
